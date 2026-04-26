@@ -174,6 +174,7 @@ pub async fn translate_tex_file(
     is_main: bool,
     provider: &Arc<Provider>,
     semaphore: &Arc<Semaphore>,
+    label: &str,
 ) -> Result<String> {
     // Find \begin{document} and \end{document}
     let doc_begin = content.find("\\begin{document}");
@@ -196,7 +197,8 @@ pub async fn translate_tex_file(
             };
 
             // Translate body in chunks
-            let translated_body = translate_chunks(body_content, provider, semaphore).await?;
+            let translated_body =
+                translate_chunks(body_content, provider, semaphore, label).await?;
 
             let mut result = new_preamble;
             result.push_str("\\begin{document}");
@@ -209,13 +211,14 @@ pub async fn translate_tex_file(
     }
 
     // For non-main files or files without \begin{document}, translate everything
-    translate_chunks(content, provider, semaphore).await
+    translate_chunks(content, provider, semaphore, label).await
 }
 
 async fn translate_chunks(
     content: &str,
     provider: &Arc<Provider>,
     semaphore: &Arc<Semaphore>,
+    label: &str,
 ) -> Result<String> {
     let chunks = split_into_chunks(content, 8000);
     let total = chunks.len();
@@ -223,8 +226,6 @@ async fn translate_chunks(
     if total == 0 {
         return Ok(content.to_string());
     }
-
-    eprintln!("  Translating {} chunk(s)...", total);
 
     let mut set: JoinSet<Result<(usize, String)>> = JoinSet::new();
     for (i, chunk) in chunks.into_iter().enumerate() {
@@ -251,7 +252,9 @@ async fn translate_chunks(
         match joined {
             Ok(Ok((i, text))) => {
                 completed += 1;
-                eprintln!("  [{}/{}] chunk done", completed, total);
+                if total > 1 {
+                    eprintln!("  {}: chunk {}/{} done", label, completed, total);
+                }
                 results[i] = Some(text);
             }
             Ok(Err(e)) => {
