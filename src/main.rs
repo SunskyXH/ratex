@@ -182,6 +182,17 @@ async fn main() -> Result<()> {
         copy_dir_recursive(work_dir.path(), &output_dir)?;
         eprintln!("[5/5] Translated .tex files saved to: {}", output_dir.display());
     } else {
+        // Patch the main tex if its \bibliography{} points at a .bib that
+        // isn't in the source archive — without this tectonic clobbers any
+        // pre-generated .bbl when it tries to run bibtex.
+        match latex::inline_missing_bibliography(&main_tex) {
+            Ok(true) => eprintln!(
+                "  Inlined pre-generated .bbl (no .bib in source) so bibtex won't clobber it."
+            ),
+            Ok(false) => {}
+            Err(e) => eprintln!("  Warning: bibliography pre-check failed: {}", e),
+        }
+
         eprintln!("[5/5] Compiling PDF with xelatex...");
         match compiler::compile(&main_tex) {
             Ok(pdf_path) => {
