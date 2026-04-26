@@ -4,7 +4,7 @@ mod config;
 mod latex;
 mod translator;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -180,7 +180,10 @@ async fn main() -> Result<()> {
             .output
             .unwrap_or_else(|| PathBuf::from(format!("{}_zh_tex", sanitized_id)));
         copy_dir_recursive(work_dir.path(), &output_dir)?;
-        eprintln!("[5/5] Translated .tex files saved to: {}", output_dir.display());
+        eprintln!(
+            "[5/5] Translated .tex files saved to: {}",
+            output_dir.display()
+        );
     } else {
         // Patch the main tex if its \bibliography{} points at a .bib that
         // isn't in the source archive — without this tectonic clobbers any
@@ -228,10 +231,12 @@ async fn main() -> Result<()> {
                         "  Translated .tex saved to: {} (so you don't have to re-translate)",
                         fallback_dir.display(),
                     );
+                    eprintln!("  After fixing the source you can recompile manually, e.g.:");
                     eprintln!(
-                        "  After fixing the source you can recompile manually, e.g.:"
+                        "    cd {} && tectonic {}",
+                        fallback_dir.display(),
+                        main_name
                     );
-                    eprintln!("    cd {} && tectonic {}", fallback_dir.display(), main_name);
                 }
                 return Err(compile_err);
             }

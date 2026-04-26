@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -149,7 +149,9 @@ impl OpenAiProvider {
 
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            bail!("Invalid OpenAI API key. Check your --api-key or OPENAI_API_KEY environment variable.");
+            bail!(
+                "Invalid OpenAI API key. Check your --api-key or OPENAI_API_KEY environment variable."
+            );
         }
 
         let body = response.text().await?;
@@ -287,8 +289,7 @@ where
             Ok(resp) => {
                 let status = resp.status();
                 // Retry on rate limit or server errors
-                if (status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                    || status.is_server_error())
+                if (status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
                     && attempt < 2
                 {
                     let delay = Duration::from_secs(2u64.pow(attempt as u32 + 1));

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,7 +12,9 @@ pub fn find_tex_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut tex_files = Vec::new();
     collect_tex_files(dir, &mut tex_files)?;
     if tex_files.is_empty() {
-        bail!("No .tex files found in the downloaded source. The paper may not have LaTeX source available.");
+        bail!(
+            "No .tex files found in the downloaded source. The paper may not have LaTeX source available."
+        );
     }
     Ok(tex_files)
 }
@@ -46,8 +48,8 @@ pub fn inline_missing_bibliography(main_tex: &Path) -> Result<bool> {
     let content = std::fs::read_to_string(main_tex)
         .with_context(|| format!("Failed to read {}", main_tex.display()))?;
 
-    let bib_re = Regex::new(r"(?m)^([ \t]*)\\bibliography\{([^}]+)\}[ \t]*$")
-        .expect("invalid regex");
+    let bib_re =
+        Regex::new(r"(?m)^([ \t]*)\\bibliography\{([^}]+)\}[ \t]*$").expect("invalid regex");
 
     let mut new_content = content.clone();
     let mut rewrote_any = false;
@@ -254,34 +256,31 @@ pub async fn translate_tex_file(
     let doc_begin = content.find("\\begin{document}");
     let doc_end = content.rfind("\\end{document}");
 
-    if is_main {
-        if let Some(begin_pos) = doc_begin {
-            let preamble = &content[..begin_pos];
-            let after_begin = &content[begin_pos..];
+    if is_main && let Some(begin_pos) = doc_begin {
+        let preamble = &content[..begin_pos];
+        let after_begin = &content[begin_pos..];
 
-            // Add CJK support to preamble
-            let new_preamble = add_cjk_support(preamble);
+        // Add CJK support to preamble
+        let new_preamble = add_cjk_support(preamble);
 
-            // Extract the body between \begin{document} and \end{document}
-            let body_start = "\\begin{document}".len();
-            let body_content = if let Some(end_pos) = after_begin.rfind("\\end{document}") {
-                &after_begin[body_start..end_pos]
-            } else {
-                &after_begin[body_start..]
-            };
+        // Extract the body between \begin{document} and \end{document}
+        let body_start = "\\begin{document}".len();
+        let body_content = if let Some(end_pos) = after_begin.rfind("\\end{document}") {
+            &after_begin[body_start..end_pos]
+        } else {
+            &after_begin[body_start..]
+        };
 
-            // Translate body in chunks
-            let translated_body =
-                translate_chunks(body_content, provider, semaphore, label).await?;
+        // Translate body in chunks
+        let translated_body = translate_chunks(body_content, provider, semaphore, label).await?;
 
-            let mut result = new_preamble;
-            result.push_str("\\begin{document}");
-            result.push_str(&translated_body);
-            if doc_end.is_some() {
-                result.push_str("\\end{document}\n");
-            }
-            return Ok(result);
+        let mut result = new_preamble;
+        result.push_str("\\begin{document}");
+        result.push_str(&translated_body);
+        if doc_end.is_some() {
+            result.push_str("\\end{document}\n");
         }
+        return Ok(result);
     }
 
     // For non-main files or files without \begin{document}, translate everything
@@ -359,10 +358,19 @@ mod tests {
         let out = add_cjk_support(src);
         // Original line is no longer an active directive — it has been
         // commented out so XeTeX doesn't see \pdfoutput=1.
-        assert!(!out.lines().any(|l| l.trim_start().starts_with("\\pdfoutput")),
-            "uncommented \\pdfoutput remained:\n{out}");
-        assert!(out.contains("[ratex] removed:"), "expected removal marker, got:\n{out}");
-        assert!(out.contains("\\usepackage{xeCJK}"), "CJK package missing:\n{out}");
+        assert!(
+            !out.lines()
+                .any(|l| l.trim_start().starts_with("\\pdfoutput")),
+            "uncommented \\pdfoutput remained:\n{out}"
+        );
+        assert!(
+            out.contains("[ratex] removed:"),
+            "expected removal marker, got:\n{out}"
+        );
+        assert!(
+            out.contains("\\usepackage{xeCJK}"),
+            "CJK package missing:\n{out}"
+        );
     }
 
     #[test]
@@ -373,10 +381,16 @@ mod tests {
             .lines()
             .filter(|l| !l.trim_start().starts_with('%') && l.contains("\\usepackage"))
             .collect();
-        assert!(!active_pkgs.iter().any(|l| l.contains("fontenc")),
-            "fontenc still active in:\n{}", active_pkgs.join("\n"));
-        assert!(!active_pkgs.iter().any(|l| l.contains("inputenc")),
-            "inputenc still active in:\n{}", active_pkgs.join("\n"));
+        assert!(
+            !active_pkgs.iter().any(|l| l.contains("fontenc")),
+            "fontenc still active in:\n{}",
+            active_pkgs.join("\n")
+        );
+        assert!(
+            !active_pkgs.iter().any(|l| l.contains("inputenc")),
+            "inputenc still active in:\n{}",
+            active_pkgs.join("\n")
+        );
     }
 
     fn make_tempdir() -> tempfile::TempDir {
@@ -395,7 +409,10 @@ mod tests {
         assert!(changed);
         let out = std::fs::read_to_string(&main).unwrap();
         assert!(out.contains("\\input{main.bbl}"), "got:\n{out}");
-        assert!(!out.contains("\\bibliography{custom}"), "still has original call:\n{out}");
+        assert!(
+            !out.contains("\\bibliography{custom}"),
+            "still has original call:\n{out}"
+        );
     }
 
     #[test]
@@ -408,7 +425,10 @@ mod tests {
 
         inline_missing_bibliography(&main).unwrap();
         let out = std::fs::read_to_string(&main).unwrap();
-        assert!(out.contains("\\input{refs.bbl}"), "expected refs.bbl, got:\n{out}");
+        assert!(
+            out.contains("\\input{refs.bbl}"),
+            "expected refs.bbl, got:\n{out}"
+        );
     }
 
     #[test]

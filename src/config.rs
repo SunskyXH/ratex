@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -111,8 +111,7 @@ pub fn load_required(path: &Path) -> Result<ConfigFile> {
 }
 
 fn parse_str(path: &Path, content: &str) -> Result<ConfigFile> {
-    toml::from_str(content)
-        .with_context(|| format!("Failed to parse config {}", path.display()))
+    toml::from_str(content).with_context(|| format!("Failed to parse config {}", path.display()))
 }
 
 /// Merge config file + CLI flags. Precedence (high → low): CLI flags, profile fields, built-in defaults.
@@ -465,10 +464,7 @@ mod tests {
 
     #[test]
     fn unknown_protocol_in_profile_errs() {
-        let c = cfg(
-            None,
-            vec![("p", profile("anthropic", None, None, None))],
-        );
+        let c = cfg(None, vec![("p", profile("anthropic", None, None, None))]);
         let err = resolve_with_env(
             Some(&c),
             ResolveInputs {

@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use regex::Regex;
 use std::io::Read;
