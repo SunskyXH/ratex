@@ -4,11 +4,12 @@ mod config;
 mod latex;
 mod translator;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 #[derive(Parser)]
 #[command(
@@ -108,33 +109,66 @@ async fn main() -> Result<()> {
         main_tex.file_name().unwrap_or_default().to_string_lossy()
     );
 
-    eprintln!("  Translating...");
-    for tex_file in &tex_files {
-        let filename = tex_file
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+    let total_files = tex_files.len();
+    eprintln!("  Translating ({} files in parallel)...", total_files);
 
-        let content = match std::fs::read_to_string(tex_file) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("  Skipping {} (cannot read: {})", filename, e);
-                continue;
+    let main_tex_arc = Arc::new(main_tex.clone());
+    let mut file_set: JoinSet<Result<Option<String>>> = JoinSet::new();
+    for tex_file in tex_files.clone() {
+        let provider = Arc::clone(&provider);
+        let semaphore = Arc::clone(&semaphore);
+        let main_tex = Arc::clone(&main_tex_arc);
+        file_set.spawn(async move {
+            let filename = tex_file
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            let content = match std::fs::read_to_string(&tex_file) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("  Skipping {} (cannot read: {})", filename, e);
+                    return Ok(None);
+                }
+            };
+            if content.trim().is_empty() {
+                return Ok(None);
             }
-        };
 
-        if content.trim().is_empty() {
-            continue;
+            let is_main = tex_file == *main_tex;
+            let label = if is_main {
+                format!("{} (main)", filename)
+            } else {
+                filename.clone()
+            };
+            let translated =
+                latex::translate_tex_file(&content, is_main, &provider, &semaphore, &label).await?;
+            std::fs::write(&tex_file, translated)
+                .with_context(|| format!("Failed to write translated {}", filename))?;
+            Ok(Some(filename))
+        });
+    }
+
+    let mut completed = 0usize;
+    while let Some(joined) = file_set.join_next().await {
+        match joined {
+            Ok(Ok(Some(filename))) => {
+                completed += 1;
+                eprintln!("  [{}/{}] {}", completed, total_files, filename);
+            }
+            Ok(Ok(None)) => {
+                completed += 1;
+            }
+            Ok(Err(e)) => {
+                file_set.abort_all();
+                return Err(e);
+            }
+            Err(e) => {
+                file_set.abort_all();
+                return Err(anyhow!("file translation task panicked: {}", e));
+            }
         }
-
-        let is_main = *tex_file == main_tex;
-        eprintln!("  Processing: {}{}", filename, if is_main { " (main)" } else { "" });
-
-        let translated =
-            latex::translate_tex_file(&content, is_main, &provider, &semaphore).await?;
-        std::fs::write(tex_file, translated)
-            .with_context(|| format!("Failed to write translated {}", filename))?;
     }
     eprintln!("  Translation complete!");
 
@@ -148,6 +182,17 @@ async fn main() -> Result<()> {
         copy_dir_recursive(work_dir.path(), &output_dir)?;
         eprintln!("[5/5] Translated .tex files saved to: {}", output_dir.display());
     } else {
+        // Patch the main tex if its \bibliography{} points at a .bib that
+        // isn't in the source archive — without this tectonic clobbers any
+        // pre-generated .bbl when it tries to run bibtex.
+        match latex::inline_missing_bibliography(&main_tex) {
+            Ok(true) => eprintln!(
+                "  Inlined pre-generated .bbl (no .bib in source) so bibtex won't clobber it."
+            ),
+            Ok(false) => {}
+            Err(e) => eprintln!("  Warning: bibliography pre-check failed: {}", e),
+        }
+
         eprintln!("[5/5] Compiling PDF with xelatex...");
         match compiler::compile(&main_tex) {
             Ok(pdf_path) => {
