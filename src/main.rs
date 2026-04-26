@@ -149,19 +149,48 @@ async fn main() -> Result<()> {
         eprintln!("[5/5] Translated .tex files saved to: {}", output_dir.display());
     } else {
         eprintln!("[5/5] Compiling PDF with xelatex...");
-        let pdf_path = compiler::compile(&main_tex)?;
-
-        let output_path = cli
-            .output
-            .unwrap_or_else(|| PathBuf::from(format!("{}_zh.pdf", sanitized_id)));
-        std::fs::copy(&pdf_path, &output_path).with_context(|| {
-            format!(
-                "Failed to copy PDF from {} to {}",
-                pdf_path.display(),
-                output_path.display()
-            )
-        })?;
-        eprintln!("Output: {}", output_path.display());
+        match compiler::compile(&main_tex) {
+            Ok(pdf_path) => {
+                let output_path = cli
+                    .output
+                    .unwrap_or_else(|| PathBuf::from(format!("{}_zh.pdf", sanitized_id)));
+                std::fs::copy(&pdf_path, &output_path).with_context(|| {
+                    format!(
+                        "Failed to copy PDF from {} to {}",
+                        pdf_path.display(),
+                        output_path.display()
+                    )
+                })?;
+                eprintln!("Output: {}", output_path.display());
+            }
+            Err(compile_err) => {
+                // Compilation failed — preserve the translated source so the
+                // user can recompile manually without re-paying for translation.
+                let fallback_dir = PathBuf::from(format!("{}_zh_tex", sanitized_id));
+                if let Err(save_err) = copy_dir_recursive(work_dir.path(), &fallback_dir) {
+                    eprintln!(
+                        "  Warning: also failed to save translated .tex to {}: {}",
+                        fallback_dir.display(),
+                        save_err,
+                    );
+                } else {
+                    let main_name = main_tex
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "<main>.tex".into());
+                    eprintln!();
+                    eprintln!(
+                        "  Translated .tex saved to: {} (so you don't have to re-translate)",
+                        fallback_dir.display(),
+                    );
+                    eprintln!(
+                        "  After fixing the source you can recompile manually, e.g.:"
+                    );
+                    eprintln!("    cd {} && tectonic {}", fallback_dir.display(), main_name);
+                }
+                return Err(compile_err);
+            }
+        }
     }
 
     Ok(())

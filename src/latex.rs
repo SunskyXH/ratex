@@ -47,7 +47,9 @@ pub fn find_main_tex(tex_files: &[PathBuf]) -> Result<PathBuf> {
 }
 
 /// Inject CJK support into the preamble of the main .tex file content.
-/// Also removes conflicting fontenc/inputenc packages.
+/// Also removes conflicting fontenc/inputenc packages and neutralizes
+/// pdfTeX-only directives that confuse hyperref's driver auto-detection
+/// when the file is compiled with XeTeX (Tectonic / xelatex).
 pub fn add_cjk_support(content: &str) -> String {
     let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
     let mut insert_pos = None;
@@ -67,6 +69,12 @@ pub fn add_cjk_support(content: &str) -> String {
             && trimmed.contains("\\usepackage")
             && (trimmed.contains("fontenc") || trimmed.contains("inputenc"))
         {
+            removals.push(i);
+        }
+
+        // \pdfoutput=1 (arXiv's pdfTeX hint) misleads hyperref into loading
+        // hpdftex.def under XeTeX, which then fails on pdfTeX-only primitives.
+        if !trimmed.starts_with('%') && trimmed.starts_with("\\pdfoutput") {
             removals.push(i);
         }
 
@@ -262,4 +270,35 @@ async fn translate_chunks(
         .map(|o| o.expect("chunk index missing — JoinSet returned fewer results than spawned"))
         .collect::<Vec<_>>()
         .join("\n\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_cjk_support_neutralizes_pdfoutput() {
+        let src = "\\pdfoutput=1\n\\documentclass{article}\n\\usepackage{hyperref}\n\\begin{document}\nhi\n\\end{document}\n";
+        let out = add_cjk_support(src);
+        // Original line is no longer an active directive — it has been
+        // commented out so XeTeX doesn't see \pdfoutput=1.
+        assert!(!out.lines().any(|l| l.trim_start().starts_with("\\pdfoutput")),
+            "uncommented \\pdfoutput remained:\n{out}");
+        assert!(out.contains("[ratex] removed:"), "expected removal marker, got:\n{out}");
+        assert!(out.contains("\\usepackage{xeCJK}"), "CJK package missing:\n{out}");
+    }
+
+    #[test]
+    fn add_cjk_support_still_removes_fontenc_inputenc() {
+        let src = "\\documentclass{article}\n\\usepackage[T1]{fontenc}\n\\usepackage[utf8]{inputenc}\n\\begin{document}\n\\end{document}\n";
+        let out = add_cjk_support(src);
+        let active_pkgs: Vec<&str> = out
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('%') && l.contains("\\usepackage"))
+            .collect();
+        assert!(!active_pkgs.iter().any(|l| l.contains("fontenc")),
+            "fontenc still active in:\n{}", active_pkgs.join("\n"));
+        assert!(!active_pkgs.iter().any(|l| l.contains("inputenc")),
+            "inputenc still active in:\n{}", active_pkgs.join("\n"));
+    }
 }
