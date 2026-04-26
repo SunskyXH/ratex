@@ -1,6 +1,9 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::translator::Provider;
 
@@ -161,7 +164,8 @@ fn split_into_chunks(body: &str, max_chars: usize) -> Vec<String> {
 pub async fn translate_tex_file(
     content: &str,
     is_main: bool,
-    provider: &Provider,
+    provider: &Arc<Provider>,
+    semaphore: &Arc<Semaphore>,
 ) -> Result<String> {
     // Find \begin{document} and \end{document}
     let doc_begin = content.find("\\begin{document}");
@@ -184,7 +188,7 @@ pub async fn translate_tex_file(
             };
 
             // Translate body in chunks
-            let translated_body = translate_chunks(body_content, provider).await?;
+            let translated_body = translate_chunks(body_content, provider, semaphore).await?;
 
             let mut result = new_preamble;
             result.push_str("\\begin{document}");
@@ -197,10 +201,14 @@ pub async fn translate_tex_file(
     }
 
     // For non-main files or files without \begin{document}, translate everything
-    translate_chunks(content, provider).await
+    translate_chunks(content, provider, semaphore).await
 }
 
-async fn translate_chunks(content: &str, provider: &Provider) -> Result<String> {
+async fn translate_chunks(
+    content: &str,
+    provider: &Arc<Provider>,
+    semaphore: &Arc<Semaphore>,
+) -> Result<String> {
     let chunks = split_into_chunks(content, 8000);
     let total = chunks.len();
 
@@ -210,15 +218,48 @@ async fn translate_chunks(content: &str, provider: &Provider) -> Result<String> 
 
     eprintln!("  Translating {} chunk(s)...", total);
 
-    let mut translated = Vec::new();
-    for (i, chunk) in chunks.iter().enumerate() {
-        eprintln!("  [{}/{}] Translating chunk...", i + 1, total);
-        let result = provider
-            .translate(chunk)
-            .await
-            .with_context(|| format!("Failed to translate chunk {}/{}", i + 1, total))?;
-        translated.push(result);
+    let mut set: JoinSet<Result<(usize, String)>> = JoinSet::new();
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        let provider = Arc::clone(provider);
+        let semaphore = Arc::clone(semaphore);
+        set.spawn(async move {
+            // Acquire happens inside the task so all chunks are queued without
+            // serializing the spawning loop on permit availability.
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("semaphore closed unexpectedly");
+            let result = provider
+                .translate(&chunk)
+                .await
+                .with_context(|| format!("Failed to translate chunk {}/{}", i + 1, total))?;
+            Ok((i, result))
+        });
     }
 
-    Ok(translated.join("\n\n"))
+    let mut results: Vec<Option<String>> = (0..total).map(|_| None).collect();
+    let mut completed = 0usize;
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Ok((i, text))) => {
+                completed += 1;
+                eprintln!("  [{}/{}] chunk done", completed, total);
+                results[i] = Some(text);
+            }
+            Ok(Err(e)) => {
+                set.abort_all();
+                return Err(e);
+            }
+            Err(e) => {
+                set.abort_all();
+                return Err(anyhow!("translation task panicked: {e}"));
+            }
+        }
+    }
+
+    Ok(results
+        .into_iter()
+        .map(|o| o.expect("chunk index missing — JoinSet returned fewer results than spawned"))
+        .collect::<Vec<_>>()
+        .join("\n\n"))
 }

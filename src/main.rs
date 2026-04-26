@@ -7,6 +7,8 @@ mod translator;
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 #[derive(Parser)]
 #[command(
@@ -49,6 +51,10 @@ struct Cli {
     /// Skip PDF compilation, output translated .tex only
     #[arg(long)]
     no_compile: bool,
+
+    /// Max concurrent translation requests (overrides profile/config)
+    #[arg(long)]
+    concurrency: Option<usize>,
 }
 
 #[tokio::main]
@@ -75,13 +81,16 @@ async fn main() -> Result<()> {
             model: cli.model.as_deref(),
             base_url: cli.base_url.as_deref(),
             api_key: cli.api_key.as_deref(),
+            concurrency: cli.concurrency,
         },
     )?;
-    let provider = translator::Provider::new(&resolved);
+    let provider = Arc::new(translator::Provider::new(&resolved));
+    let semaphore = Arc::new(Semaphore::new(resolved.concurrency));
     eprintln!(
-        "[2/5] LLM: {} (model: {})",
+        "[2/5] LLM: {} (model: {}, concurrency: {})",
         resolved.protocol.as_str(),
-        resolved.model
+        resolved.model,
+        resolved.concurrency,
     );
 
     // 3. Download and extract source
@@ -122,7 +131,8 @@ async fn main() -> Result<()> {
         let is_main = *tex_file == main_tex;
         eprintln!("  Processing: {}{}", filename, if is_main { " (main)" } else { "" });
 
-        let translated = latex::translate_tex_file(&content, is_main, &provider).await?;
+        let translated =
+            latex::translate_tex_file(&content, is_main, &provider, &semaphore).await?;
         std::fs::write(tex_file, translated)
             .with_context(|| format!("Failed to write translated {}", filename))?;
     }

@@ -48,9 +48,13 @@ impl Protocol {
     }
 }
 
+/// Built-in default for max concurrent translation requests.
+pub const DEFAULT_CONCURRENCY: usize = 4;
+
 #[derive(Deserialize, Debug, Default)]
 pub struct ConfigFile {
     pub default_profile: Option<String>,
+    pub concurrency: Option<usize>,
     #[serde(default)]
     pub profiles: HashMap<String, ProfileConfig>,
 }
@@ -61,6 +65,7 @@ pub struct ProfileConfig {
     pub endpoint: Option<String>,
     pub model: Option<String>,
     pub api_key_env: Option<String>,
+    pub concurrency: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -69,6 +74,7 @@ pub struct ResolvedProfile {
     pub endpoint: String,
     pub model: String,
     pub api_key: String,
+    pub concurrency: usize,
 }
 
 /// CLI-supplied overrides fed into [`resolve`].
@@ -79,6 +85,7 @@ pub struct ResolveInputs<'a> {
     pub model: Option<&'a str>,
     pub base_url: Option<&'a str>,
     pub api_key: Option<&'a str>,
+    pub concurrency: Option<usize>,
 }
 
 /// Forced XDG-style path on every platform: `$HOME/.config/ratex/config.toml`.
@@ -194,11 +201,21 @@ where
         })?
     };
 
+    let concurrency = cli
+        .concurrency
+        .or(base.concurrency)
+        .or(config.and_then(|c| c.concurrency))
+        .unwrap_or(DEFAULT_CONCURRENCY);
+    if concurrency == 0 {
+        bail!("concurrency must be >= 1");
+    }
+
     Ok(ResolvedProfile {
         protocol,
         endpoint,
         model,
         api_key,
+        concurrency,
     })
 }
 
@@ -209,6 +226,7 @@ fn builtin_profile(protocol: &str) -> Result<ProfileConfig> {
         endpoint: None,
         model: None,
         api_key_env: Some(p.default_api_key_env().to_string()),
+        concurrency: None,
     })
 }
 
@@ -226,6 +244,7 @@ mod tests {
     fn cfg(default: Option<&str>, profiles: Vec<(&str, ProfileConfig)>) -> ConfigFile {
         ConfigFile {
             default_profile: default.map(String::from),
+            concurrency: None,
             profiles: profiles
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))
@@ -244,6 +263,7 @@ mod tests {
             endpoint: endpoint.map(String::from),
             model: model.map(String::from),
             api_key_env: api_key_env.map(String::from),
+            concurrency: None,
         }
     }
 
@@ -460,6 +480,73 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("Unknown protocol 'anthropic'"), "got: {err}");
+    }
+
+    #[test]
+    fn concurrency_defaults_to_built_in_when_unset() {
+        let env = env_map(&[("GEMINI_API_KEY", "k")]);
+        let r = resolve_with_env(None, ResolveInputs::default(), |k| env.get(k).cloned()).unwrap();
+        assert_eq!(r.concurrency, DEFAULT_CONCURRENCY);
+    }
+
+    #[test]
+    fn concurrency_resolution_cli_beats_profile_beats_global() {
+        let mut c = cfg(
+            None,
+            vec![(
+                "p",
+                ProfileConfig {
+                    protocol: "openai".into(),
+                    endpoint: None,
+                    model: None,
+                    api_key_env: None,
+                    concurrency: Some(6),
+                },
+            )],
+        );
+        c.concurrency = Some(2);
+        let env = env_map(&[("OPENAI_API_KEY", "k")]);
+
+        // Profile concurrency overrides global.
+        let r = resolve_with_env(
+            Some(&c),
+            ResolveInputs {
+                profile: Some("p"),
+                ..Default::default()
+            },
+            |k| env.get(k).cloned(),
+        )
+        .unwrap();
+        assert_eq!(r.concurrency, 6);
+
+        // CLI overrides profile.
+        let r = resolve_with_env(
+            Some(&c),
+            ResolveInputs {
+                profile: Some("p"),
+                concurrency: Some(10),
+                ..Default::default()
+            },
+            |k| env.get(k).cloned(),
+        )
+        .unwrap();
+        assert_eq!(r.concurrency, 10);
+    }
+
+    #[test]
+    fn concurrency_zero_is_rejected() {
+        let env = env_map(&[("GEMINI_API_KEY", "k")]);
+        let err = resolve_with_env(
+            None,
+            ResolveInputs {
+                concurrency: Some(0),
+                ..Default::default()
+            },
+            |k| env.get(k).cloned(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("concurrency"), "got: {err}");
     }
 
     #[test]
