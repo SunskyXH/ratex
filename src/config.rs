@@ -4,51 +4,22 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Wire-level protocol the endpoint speaks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum Protocol {
     OpenAi,
     Gemini,
 }
 
 impl Protocol {
-    pub fn parse(s: &str) -> Result<Self> {
-        match s {
-            "openai" => Ok(Protocol::OpenAi),
-            "gemini" => Ok(Protocol::Gemini),
-            other => bail!("Unknown protocol '{}'. Supported: openai, gemini.", other),
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Protocol::OpenAi => "openai",
             Protocol::Gemini => "gemini",
         }
     }
-
-    fn default_endpoint(self) -> &'static str {
-        match self {
-            Protocol::OpenAi => "https://api.openai.com/v1",
-            Protocol::Gemini => "https://generativelanguage.googleapis.com",
-        }
-    }
-
-    fn default_model(self) -> &'static str {
-        match self {
-            Protocol::OpenAi => "gpt-4o",
-            Protocol::Gemini => "gemini-3-flash-preview",
-        }
-    }
-
-    fn default_api_key_env(self) -> &'static str {
-        match self {
-            Protocol::OpenAi => "OPENAI_API_KEY",
-            Protocol::Gemini => "GEMINI_API_KEY",
-        }
-    }
 }
 
-/// Built-in default for max concurrent translation requests.
 pub const DEFAULT_CONCURRENCY: usize = 4;
 
 #[derive(Deserialize, Debug, Default)]
@@ -61,7 +32,7 @@ pub struct ConfigFile {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct ProfileConfig {
-    pub protocol: String,
+    pub protocol: Protocol,
     pub endpoint: Option<String>,
     pub model: Option<String>,
     pub api_key_env: Option<String>,
@@ -78,13 +49,12 @@ pub struct ResolvedProfile {
 }
 
 /// CLI-supplied overrides fed into [`resolve`].
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ResolveInputs<'a> {
-    pub profile: Option<&'a str>,
-    pub provider: Option<&'a str>,
-    pub model: Option<&'a str>,
-    pub base_url: Option<&'a str>,
-    pub api_key: Option<&'a str>,
+#[derive(Debug, Default)]
+pub struct ResolveInputs {
+    pub profile: Option<String>,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
     pub concurrency: Option<usize>,
 }
 
@@ -94,7 +64,7 @@ pub fn default_config_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".config/ratex/config.toml"))
 }
 
-/// Load when the file is optional (e.g. the default path). `Ok(None)` if missing; `Err` only on read or parse failure.
+/// Load when the file is optional (e.g. the default path). `Ok(None)` if missing.
 pub fn load_optional(path: &Path) -> Result<Option<ConfigFile>> {
     match std::fs::read_to_string(path) {
         Ok(c) => Ok(Some(parse_str(path, &c)?)),
@@ -103,7 +73,7 @@ pub fn load_optional(path: &Path) -> Result<Option<ConfigFile>> {
     }
 }
 
-/// Load when the user explicitly named the file (via `--config`). Missing file is an error.
+/// Load when the user explicitly named the file (via `--config`). Missing is an error.
 pub fn load_required(path: &Path) -> Result<ConfigFile> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config {}", path.display()))?;
@@ -115,83 +85,63 @@ fn parse_str(path: &Path, content: &str) -> Result<ConfigFile> {
 }
 
 /// Merge config file + CLI flags. Precedence (high → low): CLI flags, profile fields, built-in defaults.
-pub fn resolve(config: Option<&ConfigFile>, cli: ResolveInputs<'_>) -> Result<ResolvedProfile> {
+pub fn resolve(config: Option<&ConfigFile>, cli: ResolveInputs) -> Result<ResolvedProfile> {
     resolve_with_env(config, cli, |k| std::env::var(k).ok())
 }
 
 fn resolve_with_env<F>(
     config: Option<&ConfigFile>,
-    cli: ResolveInputs<'_>,
+    cli: ResolveInputs,
     env: F,
 ) -> Result<ResolvedProfile>
 where
     F: Fn(&str) -> Option<String>,
 {
-    let base = match (cli.profile, cli.provider) {
-        (Some(_), Some(_)) => bail!("--profile and --provider cannot both be set"),
-        (Some(name), None) => {
-            let cfg = config.ok_or_else(|| {
-                anyhow!(
-                    "--profile {} given but no config file at {}",
-                    name,
-                    default_config_path()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|_| "~/.config/ratex/config.toml".into())
-                )
-            })?;
-            cfg.profiles.get(name).cloned().ok_or_else(|| {
-                let mut available: Vec<&String> = cfg.profiles.keys().collect();
-                available.sort();
-                anyhow!(
-                    "Profile '{}' not found. Available: [{}]",
-                    name,
-                    available
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })?
-        }
-        (None, Some(provider)) => {
-            eprintln!(
-                "Warning: --provider is deprecated; prefer --profile or a config file at {}",
-                default_config_path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "~/.config/ratex/config.toml".into())
-            );
-            builtin_profile(provider)?
-        }
-        (None, None) => match config.and_then(|c| c.default_profile.as_deref()) {
-            Some(name) => config
-                .unwrap()
-                .profiles
-                .get(name)
-                .cloned()
-                .ok_or_else(|| anyhow!("default_profile '{}' not found in [profiles]", name))?,
-            None => builtin_profile("gemini")?,
-        },
-    };
+    // Pick a profile: CLI --profile, else config's default_profile.
+    let profile_name = cli
+        .profile
+        .as_deref()
+        .or_else(|| config.and_then(|c| c.default_profile.as_deref()));
 
-    let protocol = Protocol::parse(&base.protocol)?;
+    let Some(name) = profile_name else {
+        bail!(
+            "No profile selected. Pass --profile <name>, or set `default_profile = ...` in {}.",
+            config_path_hint()
+        );
+    };
+    let cfg = config.ok_or_else(|| {
+        anyhow!(
+            "Profile '{}' requested but no config file at {}.",
+            name,
+            config_path_hint()
+        )
+    })?;
+    let profile = cfg.profiles.get(name).ok_or_else(|| {
+        let mut available: Vec<&str> = cfg.profiles.keys().map(String::as_str).collect();
+        available.sort();
+        anyhow!(
+            "Profile '{}' not found. Available: [{}]",
+            name,
+            available.join(", ")
+        )
+    })?;
+
     let endpoint = cli
         .base_url
-        .map(String::from)
-        .or(base.endpoint)
-        .unwrap_or_else(|| protocol.default_endpoint().to_string());
+        .or_else(|| profile.endpoint.clone())
+        .unwrap_or_else(|| default_endpoint(profile.protocol).to_string());
     let model = cli
         .model
-        .map(String::from)
-        .or(base.model)
-        .unwrap_or_else(|| protocol.default_model().to_string());
+        .or_else(|| profile.model.clone())
+        .unwrap_or_else(|| default_model(profile.protocol).to_string());
 
     let api_key = if let Some(k) = cli.api_key {
-        k.to_string()
+        k
     } else {
-        let env_var = base
+        let env_var = profile
             .api_key_env
             .as_deref()
-            .unwrap_or_else(|| protocol.default_api_key_env());
+            .unwrap_or_else(|| default_api_key_env(profile.protocol));
         env(env_var).ok_or_else(|| {
             anyhow!(
                 "API key not provided. Use --api-key or set {} environment variable.",
@@ -202,15 +152,15 @@ where
 
     let concurrency = cli
         .concurrency
-        .or(base.concurrency)
-        .or(config.and_then(|c| c.concurrency))
+        .or(profile.concurrency)
+        .or(cfg.concurrency)
         .unwrap_or(DEFAULT_CONCURRENCY);
     if concurrency == 0 {
         bail!("concurrency must be >= 1");
     }
 
     Ok(ResolvedProfile {
-        protocol,
+        protocol: profile.protocol,
         endpoint,
         model,
         api_key,
@@ -218,15 +168,31 @@ where
     })
 }
 
-fn builtin_profile(protocol: &str) -> Result<ProfileConfig> {
-    let p = Protocol::parse(protocol)?;
-    Ok(ProfileConfig {
-        protocol: p.as_str().to_string(),
-        endpoint: None,
-        model: None,
-        api_key_env: Some(p.default_api_key_env().to_string()),
-        concurrency: None,
-    })
+fn default_endpoint(p: Protocol) -> &'static str {
+    match p {
+        Protocol::OpenAi => "https://api.openai.com/v1",
+        Protocol::Gemini => "https://generativelanguage.googleapis.com",
+    }
+}
+
+fn default_model(p: Protocol) -> &'static str {
+    match p {
+        Protocol::OpenAi => "gpt-4o",
+        Protocol::Gemini => "gemini-3-flash-preview",
+    }
+}
+
+fn default_api_key_env(p: Protocol) -> &'static str {
+    match p {
+        Protocol::OpenAi => "OPENAI_API_KEY",
+        Protocol::Gemini => "GEMINI_API_KEY",
+    }
+}
+
+fn config_path_hint() -> String {
+    default_config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "~/.config/ratex/config.toml".into())
 }
 
 #[cfg(test)]
@@ -252,13 +218,13 @@ mod tests {
     }
 
     fn profile(
-        protocol: &str,
+        protocol: Protocol,
         endpoint: Option<&str>,
         model: Option<&str>,
         api_key_env: Option<&str>,
     ) -> ProfileConfig {
         ProfileConfig {
-            protocol: protocol.to_string(),
+            protocol,
             endpoint: endpoint.map(String::from),
             model: model.map(String::from),
             api_key_env: api_key_env.map(String::from),
@@ -266,42 +232,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn no_config_no_cli_uses_gemini_default() {
-        let env = env_map(&[("GEMINI_API_KEY", "test-key")]);
-        let r = resolve_with_env(None, ResolveInputs::default(), |k| env.get(k).cloned()).unwrap();
-        assert_eq!(r.protocol, Protocol::Gemini);
-        assert_eq!(r.model, "gemini-3-flash-preview");
-        assert_eq!(r.endpoint, "https://generativelanguage.googleapis.com");
-        assert_eq!(r.api_key, "test-key");
+    fn pick(profile: &str) -> ResolveInputs {
+        ResolveInputs {
+            profile: Some(profile.into()),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn provider_flag_uses_builtin_openai() {
-        let env = env_map(&[("OPENAI_API_KEY", "sk-test")]);
-        let r = resolve_with_env(
-            None,
-            ResolveInputs {
-                provider: Some("openai"),
-                ..Default::default()
-            },
-            |k| env.get(k).cloned(),
-        )
-        .unwrap();
-        assert_eq!(r.protocol, Protocol::OpenAi);
-        assert_eq!(r.model, "gpt-4o");
-        assert_eq!(r.endpoint, "https://api.openai.com/v1");
-        assert_eq!(r.api_key, "sk-test");
-    }
-
-    #[test]
-    fn default_profile_is_used() {
+    fn default_profile_is_used_when_cli_omits_it() {
         let c = cfg(
             Some("claude"),
             vec![(
                 "claude",
                 profile(
-                    "openai",
+                    Protocol::OpenAi,
                     Some("https://openrouter.ai/api/v1"),
                     Some("anthropic/claude-opus"),
                     Some("OPENROUTER_API_KEY"),
@@ -318,27 +263,13 @@ mod tests {
     }
 
     #[test]
-    fn default_profile_pointing_to_missing_errs() {
-        let c = cfg(Some("ghost"), vec![]);
-        let err = resolve_with_env(Some(&c), ResolveInputs::default(), |_| None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("default_profile 'ghost'"), "got: {err}");
-    }
-
-    #[test]
     fn profile_falls_back_to_protocol_defaults() {
-        let c = cfg(None, vec![("p", profile("openai", None, None, None))]);
+        let c = cfg(
+            None,
+            vec![("p", profile(Protocol::OpenAi, None, None, None))],
+        );
         let env = env_map(&[("OPENAI_API_KEY", "fallback")]);
-        let r = resolve_with_env(
-            Some(&c),
-            ResolveInputs {
-                profile: Some("p"),
-                ..Default::default()
-            },
-            |k| env.get(k).cloned(),
-        )
-        .unwrap();
+        let r = resolve_with_env(Some(&c), pick("p"), |k| env.get(k).cloned()).unwrap();
         assert_eq!(r.endpoint, "https://api.openai.com/v1");
         assert_eq!(r.model, "gpt-4o");
         assert_eq!(r.api_key, "fallback");
@@ -351,7 +282,7 @@ mod tests {
             vec![(
                 "p",
                 profile(
-                    "openai",
+                    Protocol::OpenAi,
                     Some("https://profile-endpoint"),
                     Some("profile-model"),
                     None,
@@ -362,9 +293,9 @@ mod tests {
         let r = resolve_with_env(
             Some(&c),
             ResolveInputs {
-                profile: Some("p"),
-                model: Some("cli-model"),
-                base_url: Some("https://cli-endpoint"),
+                profile: Some("p".into()),
+                model: Some("cli-model".into()),
+                base_url: Some("https://cli-endpoint".into()),
                 ..Default::default()
             },
             |k| env.get(k).cloned(),
@@ -376,11 +307,15 @@ mod tests {
 
     #[test]
     fn cli_api_key_beats_profile_env_and_default_env() {
+        let c = cfg(
+            Some("p"),
+            vec![("p", profile(Protocol::Gemini, None, None, None))],
+        );
         let env = env_map(&[("GEMINI_API_KEY", "from-env")]);
         let r = resolve_with_env(
-            None,
+            Some(&c),
             ResolveInputs {
-                api_key: Some("from-cli"),
+                api_key: Some("from-cli".into()),
                 ..Default::default()
             },
             |k| env.get(k).cloned(),
@@ -393,49 +328,30 @@ mod tests {
     fn profile_api_key_env_beats_protocol_default_env() {
         let c = cfg(
             None,
-            vec![("p", profile("openai", None, None, Some("CUSTOM_KEY")))],
+            vec![(
+                "p",
+                profile(Protocol::OpenAi, None, None, Some("CUSTOM_KEY")),
+            )],
         );
         let env = env_map(&[("CUSTOM_KEY", "custom"), ("OPENAI_API_KEY", "default")]);
-        let r = resolve_with_env(
-            Some(&c),
-            ResolveInputs {
-                profile: Some("p"),
-                ..Default::default()
-            },
-            |k| env.get(k).cloned(),
-        )
-        .unwrap();
+        let r = resolve_with_env(Some(&c), pick("p"), |k| env.get(k).cloned()).unwrap();
         assert_eq!(r.api_key, "custom");
     }
 
     #[test]
-    fn profile_and_provider_mutually_exclusive() {
-        let err = resolve_with_env(
-            None,
-            ResolveInputs {
-                profile: Some("a"),
-                provider: Some("openai"),
-                ..Default::default()
-            },
-            |_| None,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("cannot both be set"), "got: {err}");
+    fn no_profile_and_no_default_errs() {
+        let c = cfg(None, vec![]);
+        let err = resolve_with_env(Some(&c), ResolveInputs::default(), |_| None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("No profile selected"), "got: {err}");
     }
 
     #[test]
     fn profile_without_config_errs() {
-        let err = resolve_with_env(
-            None,
-            ResolveInputs {
-                profile: Some("x"),
-                ..Default::default()
-            },
-            |_| None,
-        )
-        .unwrap_err()
-        .to_string();
+        let err = resolve_with_env(None, pick("x"), |_| None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no config file"), "got: {err}");
     }
 
@@ -444,45 +360,31 @@ mod tests {
         let c = cfg(
             None,
             vec![
-                ("zeta", profile("openai", None, None, None)),
-                ("alpha", profile("gemini", None, None, None)),
+                ("zeta", profile(Protocol::OpenAi, None, None, None)),
+                ("alpha", profile(Protocol::Gemini, None, None, None)),
             ],
         );
-        let err = resolve_with_env(
-            Some(&c),
-            ResolveInputs {
-                profile: Some("missing"),
-                ..Default::default()
-            },
-            |_| None,
-        )
-        .unwrap_err()
-        .to_string();
+        let err = resolve_with_env(Some(&c), pick("missing"), |_| None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("Profile 'missing' not found"), "got: {err}");
         assert!(err.contains("alpha, zeta"), "got: {err}");
     }
 
     #[test]
-    fn unknown_protocol_in_profile_errs() {
-        let c = cfg(None, vec![("p", profile("anthropic", None, None, None))]);
-        let err = resolve_with_env(
-            Some(&c),
-            ResolveInputs {
-                profile: Some("p"),
-                ..Default::default()
-            },
-            |_| None,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("Unknown protocol 'anthropic'"), "got: {err}");
-    }
-
-    #[test]
-    fn concurrency_defaults_to_built_in_when_unset() {
-        let env = env_map(&[("GEMINI_API_KEY", "k")]);
-        let r = resolve_with_env(None, ResolveInputs::default(), |k| env.get(k).cloned()).unwrap();
-        assert_eq!(r.concurrency, DEFAULT_CONCURRENCY);
+    fn unknown_protocol_in_toml_errs_at_parse() {
+        let toml_str = r#"
+default_profile = "p"
+[profiles.p]
+protocol = "anthropic"
+"#;
+        let err = toml::from_str::<ConfigFile>(toml_str)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("anthropic") || err.contains("unknown variant"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -492,7 +394,7 @@ mod tests {
             vec![(
                 "p",
                 ProfileConfig {
-                    protocol: "openai".into(),
+                    protocol: Protocol::OpenAi,
                     endpoint: None,
                     model: None,
                     api_key_env: None,
@@ -503,23 +405,13 @@ mod tests {
         c.concurrency = Some(2);
         let env = env_map(&[("OPENAI_API_KEY", "k")]);
 
-        // Profile concurrency overrides global.
-        let r = resolve_with_env(
-            Some(&c),
-            ResolveInputs {
-                profile: Some("p"),
-                ..Default::default()
-            },
-            |k| env.get(k).cloned(),
-        )
-        .unwrap();
+        let r = resolve_with_env(Some(&c), pick("p"), |k| env.get(k).cloned()).unwrap();
         assert_eq!(r.concurrency, 6);
 
-        // CLI overrides profile.
         let r = resolve_with_env(
             Some(&c),
             ResolveInputs {
-                profile: Some("p"),
+                profile: Some("p".into()),
                 concurrency: Some(10),
                 ..Default::default()
             },
@@ -530,10 +422,26 @@ mod tests {
     }
 
     #[test]
+    fn concurrency_falls_back_to_built_in_default() {
+        let c = cfg(
+            Some("p"),
+            vec![("p", profile(Protocol::Gemini, None, None, None))],
+        );
+        let env = env_map(&[("GEMINI_API_KEY", "k")]);
+        let r =
+            resolve_with_env(Some(&c), ResolveInputs::default(), |k| env.get(k).cloned()).unwrap();
+        assert_eq!(r.concurrency, DEFAULT_CONCURRENCY);
+    }
+
+    #[test]
     fn concurrency_zero_is_rejected() {
+        let c = cfg(
+            Some("p"),
+            vec![("p", profile(Protocol::Gemini, None, None, None))],
+        );
         let env = env_map(&[("GEMINI_API_KEY", "k")]);
         let err = resolve_with_env(
-            None,
+            Some(&c),
             ResolveInputs {
                 concurrency: Some(0),
                 ..Default::default()
@@ -547,7 +455,11 @@ mod tests {
 
     #[test]
     fn missing_api_key_error_names_the_env_var() {
-        let err = resolve_with_env(None, ResolveInputs::default(), |_| None)
+        let c = cfg(
+            Some("p"),
+            vec![("p", profile(Protocol::Gemini, None, None, None))],
+        );
+        let err = resolve_with_env(Some(&c), ResolveInputs::default(), |_| None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("GEMINI_API_KEY"), "got: {err}");
