@@ -2,6 +2,8 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::config::{Protocol, ResolvedProfile};
+
 const SYSTEM_PROMPT: &str = r#"You are a professional academic translator. Translate the following LaTeX content from English to Chinese (Simplified Chinese).
 
 Critical rules:
@@ -26,43 +28,23 @@ pub enum Provider {
 }
 
 impl Provider {
-    /// Create a provider from CLI arguments.
-    pub fn new(
-        provider_name: &str,
-        api_key: &str,
-        model: Option<&str>,
-        base_url: Option<&str>,
-    ) -> Result<Self> {
-        match provider_name {
-            "openai" => {
-                let model = model.unwrap_or("gpt-4o").to_string();
-                let base_url = base_url
-                    .unwrap_or("https://api.openai.com/v1")
-                    .to_string();
-                Ok(Provider::OpenAi(OpenAiProvider {
-                    client: reqwest::Client::new(),
-                    api_key: api_key.to_string(),
-                    base_url,
-                    model,
-                }))
-            }
-            "gemini" => {
-                let model = model.unwrap_or("gemini-3-flash-preview").to_string();
-                let base_url = base_url
-                    .unwrap_or("https://generativelanguage.googleapis.com")
-                    .to_string();
-                Ok(Provider::Gemini(GeminiProvider {
-                    client: reqwest::Client::new(),
-                    api_key: api_key.to_string(),
-                    base_url,
-                    model,
-                }))
-            }
-            other => bail!("Unknown provider '{}'. Use 'openai' or 'gemini'.", other),
+    pub fn new(profile: &ResolvedProfile) -> Self {
+        match profile.protocol {
+            Protocol::OpenAi => Provider::OpenAi(OpenAiProvider {
+                client: reqwest::Client::new(),
+                api_key: profile.api_key.clone(),
+                base_url: profile.endpoint.clone(),
+                model: profile.model.clone(),
+            }),
+            Protocol::Gemini => Provider::Gemini(GeminiProvider {
+                client: reqwest::Client::new(),
+                api_key: profile.api_key.clone(),
+                base_url: profile.endpoint.clone(),
+                model: profile.model.clone(),
+            }),
         }
     }
 
-    /// Translate a chunk of LaTeX content.
     pub async fn translate(&self, content: &str) -> Result<String> {
         match self {
             Provider::OpenAi(p) => p.translate(content).await,
