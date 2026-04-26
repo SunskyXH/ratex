@@ -26,12 +26,8 @@ struct Cli {
     config: Option<PathBuf>,
 
     /// Use a named profile from the config file
-    #[arg(long, conflicts_with = "provider")]
+    #[arg(long)]
     profile: Option<String>,
-
-    /// LLM protocol [deprecated: use --profile or a config file]
-    #[arg(long, value_parser = ["openai", "gemini"])]
-    provider: Option<String>,
 
     /// API key (overrides profile's api_key_env)
     #[arg(long)]
@@ -77,11 +73,10 @@ async fn main() -> Result<()> {
     let resolved = config::resolve(
         config_file.as_ref(),
         config::ResolveInputs {
-            profile: cli.profile.as_deref(),
-            provider: cli.provider.as_deref(),
-            model: cli.model.as_deref(),
-            base_url: cli.base_url.as_deref(),
-            api_key: cli.api_key.as_deref(),
+            profile: cli.profile,
+            model: cli.model,
+            base_url: cli.base_url,
+            api_key: cli.api_key,
             concurrency: cli.concurrency,
         },
     )?;
