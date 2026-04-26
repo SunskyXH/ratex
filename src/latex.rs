@@ -30,6 +30,80 @@ fn collect_tex_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Replace `\bibliography{X}` in `main_tex` with `\input{X.bbl}` when no
+/// `X.bib` is available next to it but a pre-generated `.bbl` exists.
+///
+/// arXiv source archives commonly ship `main.bbl` without the underlying
+/// `.bib`. Tectonic auto-runs bibtex on every compile, which silently
+/// fails on the missing `.bib` and overwrites the pre-generated `.bbl`
+/// with an empty stub — leaving every `\cite` rendering as `?`.
+/// Inlining the existing `.bbl` keeps `\bibdata{}` out of the `.aux`,
+/// so tectonic never tries to run bibtex in the first place.
+pub fn inline_missing_bibliography(main_tex: &Path) -> Result<bool> {
+    let dir = main_tex
+        .parent()
+        .ok_or_else(|| anyhow!("main tex has no parent directory"))?;
+    let content = std::fs::read_to_string(main_tex)
+        .with_context(|| format!("Failed to read {}", main_tex.display()))?;
+
+    let bib_re = Regex::new(r"(?m)^([ \t]*)\\bibliography\{([^}]+)\}[ \t]*$")
+        .expect("invalid regex");
+
+    let mut new_content = content.clone();
+    let mut rewrote_any = false;
+    for cap in bib_re.captures_iter(&content) {
+        let full = cap.get(0).expect("regex match").as_str().to_string();
+        let names: Vec<String> = cap[2]
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // Don't touch this call if every referenced .bib is present —
+        // bibtex will work normally and we shouldn't second-guess it.
+        let any_bib_missing = names
+            .iter()
+            .any(|n| !dir.join(format!("{}.bib", n)).exists());
+        if !any_bib_missing {
+            continue;
+        }
+
+        // Find a usable .bbl. Prefer one whose stem matches a referenced
+        // name; otherwise fall back to a sibling .bbl with the same stem
+        // as the main tex (arXiv's typical layout).
+        let bbl = names
+            .iter()
+            .map(|n| dir.join(format!("{}.bbl", n)))
+            .find(|p| p.exists())
+            .or_else(|| {
+                main_tex
+                    .file_stem()
+                    .map(|stem| dir.join(format!("{}.bbl", stem.to_string_lossy())))
+                    .filter(|p| p.exists())
+            });
+
+        let Some(bbl_path) = bbl else { continue };
+        let bbl_filename = bbl_path
+            .file_name()
+            .expect("bbl path has filename")
+            .to_string_lossy();
+
+        let replacement = format!(
+            "% [ratex] no .bib found beside the source — inline pre-generated .bbl\n\
+             \\input{{{}}}",
+            bbl_filename
+        );
+        new_content = new_content.replace(&full, &replacement);
+        rewrote_any = true;
+    }
+
+    if rewrote_any {
+        std::fs::write(main_tex, &new_content)
+            .with_context(|| format!("Failed to write {}", main_tex.display()))?;
+    }
+    Ok(rewrote_any)
+}
+
 /// Find the main .tex file (the one containing \documentclass).
 pub fn find_main_tex(tex_files: &[PathBuf]) -> Result<PathBuf> {
     for file in tex_files {
@@ -303,5 +377,64 @@ mod tests {
             "fontenc still active in:\n{}", active_pkgs.join("\n"));
         assert!(!active_pkgs.iter().any(|l| l.contains("inputenc")),
             "inputenc still active in:\n{}", active_pkgs.join("\n"));
+    }
+
+    fn make_tempdir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("create tempdir")
+    }
+
+    #[test]
+    fn inline_bbl_when_bib_missing_and_matching_bbl_exists() {
+        let dir = make_tempdir();
+        let main = dir.path().join("main.tex");
+        std::fs::write(&main, "before\n\\bibliography{custom}\nafter\n").unwrap();
+        std::fs::write(dir.path().join("main.bbl"), "% bbl content").unwrap();
+        // No custom.bib, no custom.bbl — fall back to <main_stem>.bbl.
+
+        let changed = inline_missing_bibliography(&main).unwrap();
+        assert!(changed);
+        let out = std::fs::read_to_string(&main).unwrap();
+        assert!(out.contains("\\input{main.bbl}"), "got:\n{out}");
+        assert!(!out.contains("\\bibliography{custom}"), "still has original call:\n{out}");
+    }
+
+    #[test]
+    fn inline_bbl_prefers_bbl_with_referenced_name() {
+        let dir = make_tempdir();
+        let main = dir.path().join("main.tex");
+        std::fs::write(&main, "\\bibliography{refs}\n").unwrap();
+        std::fs::write(dir.path().join("refs.bbl"), "named bbl").unwrap();
+        std::fs::write(dir.path().join("main.bbl"), "stem bbl").unwrap();
+
+        inline_missing_bibliography(&main).unwrap();
+        let out = std::fs::read_to_string(&main).unwrap();
+        assert!(out.contains("\\input{refs.bbl}"), "expected refs.bbl, got:\n{out}");
+    }
+
+    #[test]
+    fn inline_bbl_skips_when_bib_present() {
+        let dir = make_tempdir();
+        let main = dir.path().join("main.tex");
+        let original = "\\bibliography{custom}\n";
+        std::fs::write(&main, original).unwrap();
+        std::fs::write(dir.path().join("custom.bib"), "@article{...}").unwrap();
+        std::fs::write(dir.path().join("custom.bbl"), "stale").unwrap();
+
+        let changed = inline_missing_bibliography(&main).unwrap();
+        assert!(!changed, "should not rewrite when .bib is present");
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), original);
+    }
+
+    #[test]
+    fn inline_bbl_noop_when_no_bbl_available() {
+        let dir = make_tempdir();
+        let main = dir.path().join("main.tex");
+        let original = "\\bibliography{custom}\n";
+        std::fs::write(&main, original).unwrap();
+        // No .bib, no .bbl anywhere — leave the file alone.
+
+        let changed = inline_missing_bibliography(&main).unwrap();
+        assert!(!changed);
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), original);
     }
 }
