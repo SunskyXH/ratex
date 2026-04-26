@@ -1,5 +1,6 @@
 mod arxiv;
 mod compiler;
+mod config;
 mod latex;
 mod translator;
 
@@ -17,19 +18,27 @@ struct Cli {
     /// arXiv paper URL or ID (e.g., https://arxiv.org/abs/2301.00001 or 2301.00001)
     url: String,
 
-    /// LLM provider
-    #[arg(long, default_value = "gemini", value_parser = ["openai", "gemini"])]
-    provider: String,
+    /// Path to config file (default: ~/.config/ratex/config.toml)
+    #[arg(long)]
+    config: Option<PathBuf>,
 
-    /// API key (overrides OPENAI_API_KEY / GEMINI_API_KEY env var)
+    /// Use a named profile from the config file
+    #[arg(long, conflicts_with = "provider")]
+    profile: Option<String>,
+
+    /// LLM protocol [deprecated: use --profile or a config file]
+    #[arg(long, value_parser = ["openai", "gemini"])]
+    provider: Option<String>,
+
+    /// API key (overrides profile's api_key_env)
     #[arg(long)]
     api_key: Option<String>,
 
-    /// Model name (default: gemini-3-flash-preview for gemini, gpt-4o for openai)
+    /// Model name (overrides profile's model)
     #[arg(long, short)]
     model: Option<String>,
 
-    /// API base URL (overrides default endpoint)
+    /// API base URL (overrides profile's endpoint)
     #[arg(long)]
     base_url: Option<String>,
 
@@ -40,27 +49,6 @@ struct Cli {
     /// Skip PDF compilation, output translated .tex only
     #[arg(long)]
     no_compile: bool,
-}
-
-impl Cli {
-    fn resolve_api_key(&self) -> Result<String> {
-        if let Some(ref key) = self.api_key {
-            return Ok(key.clone());
-        }
-
-        let env_var = match self.provider.as_str() {
-            "openai" => "OPENAI_API_KEY",
-            "gemini" => "GEMINI_API_KEY",
-            _ => unreachable!(),
-        };
-
-        std::env::var(env_var).with_context(|| {
-            format!(
-                "No API key provided. Use --api-key or set the {} environment variable.",
-                env_var
-            )
-        })
-    }
 }
 
 #[tokio::main]
@@ -74,15 +62,27 @@ async fn main() -> Result<()> {
     let arxiv_id = arxiv::parse_id(&cli.url)?;
     eprintln!("[1/5] Paper ID: {}", arxiv_id);
 
-    // 2. Resolve API key and create provider
-    let api_key = cli.resolve_api_key()?;
-    let provider = translator::Provider::new(
-        &cli.provider,
-        &api_key,
-        cli.model.as_deref(),
-        cli.base_url.as_deref(),
+    // 2. Load config, resolve profile, create provider
+    let config_file = match cli.config.as_ref() {
+        Some(path) => Some(config::load_required(path)?),
+        None => config::load_optional(&config::default_config_path()?)?,
+    };
+    let resolved = config::resolve(
+        config_file.as_ref(),
+        config::ResolveInputs {
+            profile: cli.profile.as_deref(),
+            provider: cli.provider.as_deref(),
+            model: cli.model.as_deref(),
+            base_url: cli.base_url.as_deref(),
+            api_key: cli.api_key.as_deref(),
+        },
     )?;
-    eprintln!("[2/5] LLM provider: {}", cli.provider);
+    let provider = translator::Provider::new(&resolved);
+    eprintln!(
+        "[2/5] LLM: {} (model: {})",
+        resolved.protocol.as_str(),
+        resolved.model
+    );
 
     // 3. Download and extract source
     let work_dir = tempfile::tempdir().context("Failed to create temp directory")?;
