@@ -31,13 +31,13 @@ impl Provider {
     pub fn new(profile: &ResolvedProfile) -> Self {
         match profile.protocol {
             Protocol::OpenAi => Provider::OpenAi(OpenAiProvider {
-                client: reqwest::Client::new(),
+                client: build_http_client(),
                 api_key: profile.api_key.clone(),
                 base_url: profile.endpoint.clone(),
                 model: profile.model.clone(),
             }),
             Protocol::Gemini => Provider::Gemini(GeminiProvider {
-                client: reqwest::Client::new(),
+                client: build_http_client(),
                 api_key: profile.api_key.clone(),
                 base_url: profile.endpoint.clone(),
                 model: profile.model.clone(),
@@ -51,6 +51,16 @@ impl Provider {
             Provider::Gemini(p) => p.translate(content).await,
         }
     }
+}
+
+/// Build the shared HTTP client with sensible timeouts so a stalled
+/// connection can't hang the whole pipeline forever.
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(180))
+        .build()
+        .expect("failed to build HTTP client")
 }
 
 /// Strip markdown code fences if the LLM wrapped the response.
@@ -297,7 +307,7 @@ where
                     let delay = Duration::from_secs(2u64.pow(attempt as u32 + 1));
                     eprintln!(
                         "  Request failed ({}), retrying in {}s...",
-                        e,
+                        redact_secrets(&e.to_string()),
                         delay.as_secs()
                     );
                     tokio::time::sleep(delay).await;
@@ -309,4 +319,38 @@ where
         }
     }
     Err(last_err.unwrap().into())
+}
+
+/// Strip query parameters that look like API keys (e.g. Gemini's `?key=...`)
+/// from error messages so they don't end up in logs.
+fn redact_secrets(msg: &str) -> String {
+    // Replace `key=...` query value up to the next `&` or end of token.
+    let re = regex::Regex::new(r"([?&]key=)[^&\s\)]+").expect("valid regex");
+    re.replace_all(msg, "${1}REDACTED").into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_gemini_key_query_param() {
+        let msg = "error sending request for url (https://x/v1beta?key=AIza-secret-123)";
+        let r = redact_secrets(msg);
+        assert!(!r.contains("AIza-secret-123"), "got: {r}");
+        assert!(r.contains("key=REDACTED"), "got: {r}");
+    }
+
+    #[test]
+    fn redacts_key_in_middle_of_query_string() {
+        let msg = "url (https://x?foo=1&key=topsecret&bar=2)";
+        let r = redact_secrets(msg);
+        assert_eq!(r, "url (https://x?foo=1&key=REDACTED&bar=2)");
+    }
+
+    #[test]
+    fn leaves_unrelated_text_alone() {
+        let msg = "no secrets here";
+        assert_eq!(redact_secrets(msg), msg);
+    }
 }
