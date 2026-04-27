@@ -241,6 +241,83 @@ fn split_into_chunks(body: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
+/// Translate every `.tex` file in `tex_files` in parallel, in place.
+///
+/// Each file becomes its own task, all sharing the chunk-level
+/// `Arc<Semaphore>` so total in-flight API calls stay bounded by the
+/// configured concurrency. Empty / unreadable files are skipped with a
+/// warning. On the first task error every other task is aborted and
+/// the error is propagated (fail-fast, same as chunk-level).
+pub async fn translate_all(
+    tex_files: &[PathBuf],
+    main_tex: &Path,
+    provider: Arc<Provider>,
+    semaphore: Arc<Semaphore>,
+) -> Result<()> {
+    let total = tex_files.len();
+    eprintln!("  Translating ({} files in parallel)...", total);
+
+    let main_tex = Arc::new(main_tex.to_path_buf());
+    let mut set: JoinSet<Result<Option<String>>> = JoinSet::new();
+    for tex_file in tex_files.iter().cloned() {
+        let provider = Arc::clone(&provider);
+        let semaphore = Arc::clone(&semaphore);
+        let main_tex = Arc::clone(&main_tex);
+        set.spawn(async move {
+            let filename = tex_file
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            let content = match std::fs::read_to_string(&tex_file) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("  Skipping {} (cannot read: {})", filename, e);
+                    return Ok(None);
+                }
+            };
+            if content.trim().is_empty() {
+                return Ok(None);
+            }
+
+            let is_main = tex_file == *main_tex;
+            let label = if is_main {
+                format!("{} (main)", filename)
+            } else {
+                filename.clone()
+            };
+            let translated =
+                translate_tex_file(&content, is_main, &provider, &semaphore, &label).await?;
+            std::fs::write(&tex_file, translated)
+                .with_context(|| format!("Failed to write translated {}", filename))?;
+            Ok(Some(filename))
+        });
+    }
+
+    let mut completed = 0usize;
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Ok(Some(filename))) => {
+                completed += 1;
+                eprintln!("  [{}/{}] {}", completed, total, filename);
+            }
+            Ok(Ok(None)) => {
+                completed += 1;
+            }
+            Ok(Err(e)) => {
+                set.abort_all();
+                return Err(e);
+            }
+            Err(e) => {
+                set.abort_all();
+                return Err(anyhow!("file translation task panicked: {}", e));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Translate a single .tex file content.
 ///
 /// If `is_main` is true, CJK support is injected into the preamble and only
