@@ -61,6 +61,22 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Pre-flight: detect the compiler now, before translation, so a missing CLI
+    // doesn't waste the LLM bill. Missing → save translated .tex for manual compile.
+    let no_compile = cli.no_compile || {
+        match compiler::check_available() {
+            Ok(()) => false,
+            Err(e) => {
+                eprintln!("{}", e);
+                eprintln!();
+                eprintln!("Continuing in --no-compile mode (translated .tex will be saved).");
+                eprintln!("You can upload it to Overleaf, or install a compiler and rerun.");
+                eprintln!();
+                true
+            }
+        }
+    };
+
     // 1. Parse arXiv ID
     let arxiv_id = arxiv::parse_id(&cli.url)?;
     eprintln!("[1/5] Paper ID: {}", arxiv_id);
@@ -110,7 +126,7 @@ async fn main() -> Result<()> {
     // 5. Compile or copy output
     let sanitized_id = arxiv_id.replace('/', "_");
 
-    if cli.no_compile {
+    if no_compile {
         let output_dir = cli
             .output
             .unwrap_or_else(|| PathBuf::from(format!("{}_zh_tex", sanitized_id)));

@@ -39,6 +39,11 @@ fn detect_compiler() -> Result<Compiler> {
     )
 }
 
+/// Returns Ok(()) if a TeX compiler is available, Err with install instructions otherwise.
+pub fn check_available() -> Result<()> {
+    detect_compiler().map(|_| ())
+}
+
 /// Compile the translated LaTeX to PDF.
 /// Returns the path to the generated PDF.
 pub fn compile(main_tex: &Path) -> Result<PathBuf> {
