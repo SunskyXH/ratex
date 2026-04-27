@@ -3,6 +3,7 @@ mod compiler;
 mod config;
 mod latex;
 mod translator;
+mod utils;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -113,87 +114,70 @@ async fn main() -> Result<()> {
         let output_dir = cli
             .output
             .unwrap_or_else(|| PathBuf::from(format!("{}_zh_tex", sanitized_id)));
-        copy_dir_recursive(work_dir.path(), &output_dir)?;
+        utils::copy_dir_recursive(work_dir.path(), &output_dir)?;
         eprintln!(
             "[5/5] Translated .tex files saved to: {}",
             output_dir.display()
         );
-    } else {
-        // Patch the main tex if its \bibliography{} points at a .bib that
-        // isn't in the source archive — without this tectonic clobbers any
-        // pre-generated .bbl when it tries to run bibtex.
-        match latex::inline_missing_bibliography(&main_tex) {
-            Ok(true) => eprintln!(
-                "  Inlined pre-generated .bbl (no .bib in source) so bibtex won't clobber it."
-            ),
-            Ok(false) => {}
-            Err(e) => eprintln!("  Warning: bibliography pre-check failed: {}", e),
-        }
-
-        eprintln!("[5/5] Compiling PDF with xelatex...");
-        match compiler::compile(&main_tex) {
-            Ok(pdf_path) => {
-                let output_path = cli
-                    .output
-                    .unwrap_or_else(|| PathBuf::from(format!("{}_zh.pdf", sanitized_id)));
-                std::fs::copy(&pdf_path, &output_path).with_context(|| {
-                    format!(
-                        "Failed to copy PDF from {} to {}",
-                        pdf_path.display(),
-                        output_path.display()
-                    )
-                })?;
-                eprintln!("Output: {}", output_path.display());
-            }
-            Err(compile_err) => {
-                // Compilation failed — preserve the translated source so the
-                // user can recompile manually without re-paying for translation.
-                let fallback_dir = PathBuf::from(format!("{}_zh_tex", sanitized_id));
-                if let Err(save_err) = copy_dir_recursive(work_dir.path(), &fallback_dir) {
-                    eprintln!(
-                        "  Warning: also failed to save translated .tex to {}: {}",
-                        fallback_dir.display(),
-                        save_err,
-                    );
-                } else {
-                    let main_name = main_tex
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "<main>.tex".into());
-                    eprintln!();
-                    eprintln!(
-                        "  Translated .tex saved to: {} (so you don't have to re-translate)",
-                        fallback_dir.display(),
-                    );
-                    eprintln!("  After fixing the source you can recompile manually, e.g.:");
-                    eprintln!(
-                        "    cd {} && tectonic {}",
-                        fallback_dir.display(),
-                        main_name
-                    );
-                }
-                return Err(compile_err);
-            }
-        }
+        return Ok(());
     }
 
-    Ok(())
-}
+    // Patch the main tex if its \bibliography{} points at a .bib that
+    // isn't in the source archive — without this tectonic clobbers any
+    // pre-generated .bbl when it tries to run bibtex.
+    match latex::inline_missing_bibliography(&main_tex) {
+        Ok(true) => eprintln!(
+            "  Inlined pre-generated .bbl (no .bib in source) so bibtex won't clobber it."
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!("  Warning: bibliography pre-check failed: {}", e),
+    }
 
-/// Recursively copy all files and directories from `src` to `dst`.
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
-    if !dst.exists() {
-        std::fs::create_dir_all(dst)?;
-    }
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let path = entry.path();
-        let dest_path = dst.join(entry.file_name());
-        if path.is_dir() {
-            copy_dir_recursive(&path, &dest_path)?;
-        } else {
-            std::fs::copy(&path, &dest_path)?;
+    eprintln!("[5/5] Compiling PDF with xelatex...");
+    let compile_err = match compiler::compile(&main_tex) {
+        Ok(pdf_path) => {
+            let output_path = cli
+                .output
+                .unwrap_or_else(|| PathBuf::from(format!("{}_zh.pdf", sanitized_id)));
+            std::fs::copy(&pdf_path, &output_path).with_context(|| {
+                format!(
+                    "Failed to copy PDF from {} to {}",
+                    pdf_path.display(),
+                    output_path.display()
+                )
+            })?;
+            eprintln!("Output: {}", output_path.display());
+            return Ok(());
         }
+        Err(e) => e,
+    };
+
+    // Compilation failed — preserve the translated source so the
+    // user can recompile manually without re-paying for translation.
+    let fallback_dir = PathBuf::from(format!("{}_zh_tex", sanitized_id));
+    if let Err(save_err) = utils::copy_dir_recursive(work_dir.path(), &fallback_dir) {
+        eprintln!(
+            "  Warning: also failed to save translated .tex to {}: {}",
+            fallback_dir.display(),
+            save_err,
+        );
+        return Err(compile_err);
     }
-    Ok(())
+
+    let main_name = main_tex
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<main>.tex".into());
+    eprintln!();
+    eprintln!(
+        "  Translated .tex saved to: {} (so you don't have to re-translate)",
+        fallback_dir.display(),
+    );
+    eprintln!("  After fixing the source you can recompile manually, e.g.:");
+    eprintln!(
+        "    cd {} && tectonic {}",
+        fallback_dir.display(),
+        main_name
+    );
+    Err(compile_err)
 }

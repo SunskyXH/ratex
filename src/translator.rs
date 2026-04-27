@@ -66,20 +66,17 @@ fn build_http_client() -> reqwest::Client {
 /// Strip markdown code fences if the LLM wrapped the response.
 fn strip_code_fences(text: &str) -> String {
     let trimmed = text.trim();
-    if trimmed.starts_with("```") {
-        // Remove opening fence (```latex or ```)
-        let after_open = if let Some(pos) = trimmed.find('\n') {
-            &trimmed[pos + 1..]
-        } else {
-            return trimmed.to_string();
-        };
-        // Remove closing fence
-        if let Some(pos) = after_open.rfind("```") {
-            return after_open[..pos].trim_end().to_string();
-        }
-        return after_open.to_string();
+    if !trimmed.starts_with("```") {
+        return trimmed.to_string();
     }
-    trimmed.to_string()
+    let Some(newline) = trimmed.find('\n') else {
+        return trimmed.to_string();
+    };
+    let after_open = &trimmed[newline + 1..];
+    if let Some(close) = after_open.rfind("```") {
+        return after_open[..close].trim_end().to_string();
+    }
+    after_open.to_string()
 }
 
 // ─── OpenAI ──────────────────────────────────────────────────────────────────
