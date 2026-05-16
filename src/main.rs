@@ -7,7 +7,7 @@ mod utils;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -18,7 +18,7 @@ use tokio::sync::Semaphore;
     about = "Translate arXiv papers from English to Chinese"
 )]
 struct Cli {
-    /// arXiv paper URL or ID (e.g., https://arxiv.org/abs/2301.00001 or 2301.00001)
+    /// arXiv paper URL or ID (e.g., <https://arxiv.org/abs/2301.00001> or 2301.00001)
     url: String,
 
     /// Path to config file (default: ~/.config/ratex/config.toml)
@@ -29,7 +29,7 @@ struct Cli {
     #[arg(long)]
     profile: Option<String>,
 
-    /// API key (overrides profile's api_key_env)
+    /// API key (overrides profile's `api_key_env`)
     #[arg(long)]
     api_key: Option<String>,
 
@@ -41,7 +41,7 @@ struct Cli {
     #[arg(long)]
     base_url: Option<String>,
 
-    /// Output file path (default: {paper_id}_zh.pdf)
+    /// Output file path (default: `{paper_id}_zh.pdf`)
     #[arg(long, short)]
     output: Option<PathBuf>,
 
@@ -60,42 +60,20 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
 
     let cli = Cli::parse();
+    run(cli).await
+}
 
+async fn run(cli: Cli) -> Result<()> {
     // Pre-flight: detect the compiler now, before translation, so a missing CLI
     // doesn't waste the LLM bill. Missing → save translated .tex for manual compile.
-    let no_compile = cli.no_compile || {
-        match compiler::check_available() {
-            Ok(()) => false,
-            Err(e) => {
-                eprintln!("{}", e);
-                eprintln!();
-                eprintln!("Continuing in --no-compile mode (translated .tex will be saved).");
-                eprintln!("You can upload it to Overleaf, or install a compiler and rerun.");
-                eprintln!();
-                true
-            }
-        }
-    };
+    let no_compile = preflight_no_compile(cli.no_compile);
 
     // 1. Parse arXiv ID
     let arxiv_id = arxiv::parse_id(&cli.url)?;
-    eprintln!("[1/5] Paper ID: {}", arxiv_id);
+    eprintln!("[1/5] Paper ID: {arxiv_id}");
 
     // 2. Load config, resolve profile, create provider
-    let config_file = match cli.config.as_ref() {
-        Some(path) => Some(config::load_required(path)?),
-        None => config::load_optional(&config::default_config_path()?)?,
-    };
-    let resolved = config::resolve(
-        config_file.as_ref(),
-        config::ResolveInputs {
-            profile: cli.profile,
-            model: cli.model,
-            base_url: cli.base_url,
-            api_key: cli.api_key,
-            concurrency: cli.concurrency,
-        },
-    )?;
+    let resolved = resolve_profile(&cli)?;
     let provider = Arc::new(translator::Provider::new(&resolved));
     let semaphore = Arc::new(Semaphore::new(resolved.concurrency));
     eprintln!(
@@ -127,34 +105,93 @@ async fn main() -> Result<()> {
     let sanitized_id = arxiv_id.replace('/', "_");
 
     if no_compile {
-        let output_dir = cli
-            .output
-            .unwrap_or_else(|| PathBuf::from(format!("{}_zh_tex", sanitized_id)));
-        utils::copy_dir_recursive(work_dir.path(), &output_dir)?;
-        eprintln!(
-            "[5/5] Translated .tex files saved to: {}",
-            output_dir.display()
-        );
+        save_translated_source(work_dir.path(), cli.output.as_ref(), &sanitized_id)?;
         return Ok(());
     }
 
+    compile_pdf_or_save_source(
+        work_dir.path(),
+        &main_tex,
+        cli.output.as_ref(),
+        &sanitized_id,
+    )
+}
+
+fn preflight_no_compile(no_compile_flag: bool) -> bool {
+    if no_compile_flag {
+        return true;
+    }
+
+    match compiler::check_available() {
+        Ok(()) => false,
+        Err(e) => {
+            eprintln!("{e}");
+            eprintln!();
+            eprintln!("Continuing in --no-compile mode (translated .tex will be saved).");
+            eprintln!("You can upload it to Overleaf, or install a compiler and rerun.");
+            eprintln!();
+            true
+        }
+    }
+}
+
+fn resolve_profile(cli: &Cli) -> Result<config::ResolvedProfile> {
+    let config_file = match cli.config.as_ref() {
+        Some(path) => Some(config::load_required(path)?),
+        None => config::load_optional(&config::default_config_path()?)?,
+    };
+
+    config::resolve(
+        config_file.as_ref(),
+        config::ResolveInputs {
+            profile: cli.profile.clone(),
+            model: cli.model.clone(),
+            base_url: cli.base_url.clone(),
+            api_key: cli.api_key.clone(),
+            concurrency: cli.concurrency,
+        },
+    )
+}
+
+fn save_translated_source(
+    work_dir: &Path,
+    output: Option<&PathBuf>,
+    sanitized_id: &str,
+) -> Result<()> {
+    let output_dir = output
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(format!("{sanitized_id}_zh_tex")));
+    utils::copy_dir_recursive(work_dir, &output_dir)?;
+    eprintln!(
+        "[5/5] Translated .tex files saved to: {}",
+        output_dir.display()
+    );
+    Ok(())
+}
+
+fn compile_pdf_or_save_source(
+    work_dir: &Path,
+    main_tex: &Path,
+    output: Option<&PathBuf>,
+    sanitized_id: &str,
+) -> Result<()> {
     // Patch the main tex if its \bibliography{} points at a .bib that
     // isn't in the source archive — without this tectonic clobbers any
     // pre-generated .bbl when it tries to run bibtex.
-    match latex::inline_missing_bibliography(&main_tex) {
+    match latex::inline_missing_bibliography(main_tex) {
         Ok(true) => eprintln!(
             "  Inlined pre-generated .bbl (no .bib in source) so bibtex won't clobber it."
         ),
         Ok(false) => {}
-        Err(e) => eprintln!("  Warning: bibliography pre-check failed: {}", e),
+        Err(e) => eprintln!("  Warning: bibliography pre-check failed: {e}"),
     }
 
-    eprintln!("[5/5] Compiling PDF with xelatex...");
-    let compile_err = match compiler::compile(&main_tex) {
+    eprintln!("[5/5] Compiling PDF...");
+    let compile_err = match compiler::compile(main_tex) {
         Ok(pdf_path) => {
-            let output_path = cli
-                .output
-                .unwrap_or_else(|| PathBuf::from(format!("{}_zh.pdf", sanitized_id)));
+            let output_path = output
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from(format!("{sanitized_id}_zh.pdf")));
             std::fs::copy(&pdf_path, &output_path).with_context(|| {
                 format!(
                     "Failed to copy PDF from {} to {}",
@@ -170,8 +207,8 @@ async fn main() -> Result<()> {
 
     // Compilation failed — preserve the translated source so the
     // user can recompile manually without re-paying for translation.
-    let fallback_dir = PathBuf::from(format!("{}_zh_tex", sanitized_id));
-    if let Err(save_err) = utils::copy_dir_recursive(work_dir.path(), &fallback_dir) {
+    let fallback_dir = PathBuf::from(format!("{sanitized_id}_zh_tex"));
+    if let Err(save_err) = utils::copy_dir_recursive(work_dir, &fallback_dir) {
         eprintln!(
             "  Warning: also failed to save translated .tex to {}: {}",
             fallback_dir.display(),
@@ -182,8 +219,7 @@ async fn main() -> Result<()> {
 
     let main_name = main_tex
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "<main>.tex".into());
+        .map_or_else(|| "<main>.tex".into(), |n| n.to_string_lossy().into_owned());
     eprintln!();
     eprintln!(
         "  Translated .tex saved to: {} (so you don't have to re-translate)",
