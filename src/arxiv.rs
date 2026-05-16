@@ -121,16 +121,12 @@ fn looks_like_tar(bytes: &[u8]) -> bool {
 }
 
 fn parse_tar_checksum(field: &[u8]) -> Option<u32> {
-    let digits: Vec<u8> = field
-        .iter()
-        .copied()
-        .filter(|byte| !byte.is_ascii_whitespace() && *byte != 0)
-        .collect();
-    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+    let value = std::str::from_utf8(field).ok()?;
+    let value = value.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+    if value.is_empty() {
         return None;
     }
 
-    let value = std::str::from_utf8(&digits).ok()?;
     u32::from_str_radix(value, 8).ok()
 }
 

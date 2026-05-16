@@ -105,14 +105,14 @@ async fn run(cli: Cli) -> Result<()> {
     let sanitized_id = arxiv_id.replace('/', "_");
 
     if no_compile {
-        save_translated_source(work_dir.path(), cli.output.as_ref(), &sanitized_id)?;
+        save_translated_source(work_dir.path(), cli.output.as_deref(), &sanitized_id)?;
         return Ok(());
     }
 
     compile_pdf_or_save_source(
         work_dir.path(),
         &main_tex,
-        cli.output.as_ref(),
+        cli.output.as_deref(),
         &sanitized_id,
     )
 }
@@ -155,12 +155,13 @@ fn resolve_profile(cli: &Cli) -> Result<config::ResolvedProfile> {
 
 fn save_translated_source(
     work_dir: &Path,
-    output: Option<&PathBuf>,
+    output: Option<&Path>,
     sanitized_id: &str,
 ) -> Result<()> {
-    let output_dir = output
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from(format!("{sanitized_id}_zh_tex")));
+    let output_dir = match output {
+        Some(path) => path.to_path_buf(),
+        None => PathBuf::from(format!("{sanitized_id}_zh_tex")),
+    };
     utils::copy_dir_recursive(work_dir, &output_dir)?;
     eprintln!(
         "[5/5] Translated .tex files saved to: {}",
@@ -172,7 +173,7 @@ fn save_translated_source(
 fn compile_pdf_or_save_source(
     work_dir: &Path,
     main_tex: &Path,
-    output: Option<&PathBuf>,
+    output: Option<&Path>,
     sanitized_id: &str,
 ) -> Result<()> {
     // Patch the main tex if its \bibliography{} points at a .bib that
@@ -189,9 +190,10 @@ fn compile_pdf_or_save_source(
     eprintln!("[5/5] Compiling PDF...");
     let compile_err = match compiler::compile(main_tex) {
         Ok(pdf_path) => {
-            let output_path = output
-                .cloned()
-                .unwrap_or_else(|| PathBuf::from(format!("{sanitized_id}_zh.pdf")));
+            let output_path = match output {
+                Some(path) => path.to_path_buf(),
+                None => PathBuf::from(format!("{sanitized_id}_zh.pdf")),
+            };
             std::fs::copy(&pdf_path, &output_path).with_context(|| {
                 format!(
                     "Failed to copy PDF from {} to {}",
@@ -217,9 +219,10 @@ fn compile_pdf_or_save_source(
         return Err(compile_err);
     }
 
-    let main_name = main_tex
-        .file_name()
-        .map_or_else(|| "<main>.tex".into(), |n| n.to_string_lossy().into_owned());
+    let main_name = match main_tex.file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => "<main>.tex".into(),
+    };
     eprintln!();
     eprintln!(
         "  Translated .tex saved to: {} (so you don't have to re-translate)",

@@ -216,22 +216,22 @@ fn split_into_chunks(body: &str, max_bytes: usize) -> Vec<String> {
     for section in sections {
         if section.len() <= max_bytes {
             chunks.push(section);
-        } else {
-            // Split at paragraph boundaries (double newlines)
-            let mut current = String::new();
-            for paragraph in section.split("\n\n") {
-                if current.len() + paragraph.len() + 2 > max_bytes && !current.is_empty() {
-                    chunks.push(current.clone());
-                    current.clear();
-                }
-                if !current.is_empty() {
-                    current.push_str("\n\n");
-                }
-                current.push_str(paragraph);
+            continue;
+        }
+
+        // Split at paragraph boundaries (double newlines)
+        let mut current = String::new();
+        for paragraph in section.split("\n\n") {
+            if current.len() + paragraph.len() + 2 > max_bytes && !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
             }
             if !current.is_empty() {
-                chunks.push(current);
+                current.push_str("\n\n");
             }
+            current.push_str(paragraph);
+        }
+        if !current.is_empty() {
+            chunks.push(current);
         }
     }
 

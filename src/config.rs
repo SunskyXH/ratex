@@ -187,10 +187,10 @@ fn default_api_key_env(p: Protocol) -> &'static str {
 }
 
 fn config_path_hint() -> String {
-    default_config_path().map_or_else(
-        |_| "~/.config/ratex/config.toml".into(),
-        |p| p.display().to_string(),
-    )
+    match default_config_path() {
+        Ok(path) => path.display().to_string(),
+        Err(_) => "~/.config/ratex/config.toml".into(),
+    }
 }
 
 #[cfg(test)]
