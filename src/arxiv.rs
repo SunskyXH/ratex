@@ -105,17 +105,13 @@ fn looks_like_tar(bytes: &[u8]) -> bool {
         return false;
     };
 
-    let computed_checksum = header
+    // Checksum is computed as if the checksum field itself were ASCII spaces.
+    let computed_checksum: u32 = header[..CHECKSUM_START]
         .iter()
-        .enumerate()
-        .map(|(idx, byte)| {
-            if (CHECKSUM_START..CHECKSUM_END).contains(&idx) {
-                u32::from(b' ')
-            } else {
-                u32::from(*byte)
-            }
-        })
-        .sum::<u32>();
+        .chain(&header[CHECKSUM_END..])
+        .chain(std::iter::repeat_n(&b' ', CHECKSUM_END - CHECKSUM_START))
+        .map(|&b| u32::from(b))
+        .sum();
 
     stored_checksum == computed_checksum
 }

@@ -246,7 +246,7 @@ fn split_into_chunks(body: &str, max_bytes: usize) -> Vec<String> {
 /// warning. On the first task error every other task is aborted and
 /// the error is propagated (fail-fast, same as chunk-level).
 pub async fn translate_all(
-    tex_files: &[PathBuf],
+    tex_files: Vec<PathBuf>,
     main_tex: &Path,
     provider: Arc<Provider>,
     semaphore: Arc<Semaphore>,
@@ -254,12 +254,11 @@ pub async fn translate_all(
     let total = tex_files.len();
     eprintln!("  Translating ({total} files in parallel)...");
 
-    let main_tex = Arc::new(main_tex.to_path_buf());
     let mut set: JoinSet<Result<Option<String>>> = JoinSet::new();
-    for tex_file in tex_files.iter().cloned() {
+    for tex_file in tex_files {
+        let is_main = tex_file.as_path() == main_tex;
         let provider = Arc::clone(&provider);
         let semaphore = Arc::clone(&semaphore);
-        let main_tex = Arc::clone(&main_tex);
         set.spawn(async move {
             let filename = tex_file
                 .file_name()
@@ -278,7 +277,6 @@ pub async fn translate_all(
                 return Ok(None);
             }
 
-            let is_main = tex_file == *main_tex;
             let label = if is_main {
                 format!("{filename} (main)")
             } else {

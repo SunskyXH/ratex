@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+use config::ResolveInputs;
+
 #[derive(Parser)]
 #[command(
     name = "ratex",
@@ -64,16 +66,37 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    let Cli {
+        url,
+        config,
+        profile,
+        api_key,
+        model,
+        base_url,
+        output,
+        no_compile,
+        concurrency,
+    } = cli;
+
     // Pre-flight: detect the compiler now, before translation, so a missing CLI
     // doesn't waste the LLM bill. Missing → save translated .tex for manual compile.
-    let no_compile = preflight_no_compile(cli.no_compile);
+    let no_compile = preflight_no_compile(no_compile);
 
     // 1. Parse arXiv ID
-    let arxiv_id = arxiv::parse_id(&cli.url)?;
+    let arxiv_id = arxiv::parse_id(&url)?;
     eprintln!("[1/5] Paper ID: {arxiv_id}");
 
     // 2. Load config, resolve profile, create provider
-    let resolved = resolve_profile(&cli)?;
+    let resolved = resolve_profile(
+        config.as_deref(),
+        ResolveInputs {
+            profile,
+            model,
+            base_url,
+            api_key,
+            concurrency,
+        },
+    )?;
     let provider = Arc::new(translator::Provider::new(&resolved));
     let semaphore = Arc::new(Semaphore::new(resolved.concurrency));
     eprintln!(
@@ -98,23 +121,18 @@ async fn run(cli: Cli) -> Result<()> {
         main_tex.file_name().unwrap_or_default().to_string_lossy()
     );
 
-    latex::translate_all(&tex_files, &main_tex, provider, semaphore).await?;
+    latex::translate_all(tex_files, &main_tex, provider, semaphore).await?;
     eprintln!("  Translation complete!");
 
     // 5. Compile or copy output
     let sanitized_id = arxiv_id.replace('/', "_");
 
     if no_compile {
-        save_translated_source(work_dir.path(), cli.output.as_deref(), &sanitized_id)?;
+        save_translated_source(work_dir.path(), output.as_deref(), &sanitized_id)?;
         return Ok(());
     }
 
-    compile_pdf_or_save_source(
-        work_dir.path(),
-        &main_tex,
-        cli.output.as_deref(),
-        &sanitized_id,
-    )
+    compile_pdf_or_save_source(work_dir.path(), &main_tex, output.as_deref(), &sanitized_id)
 }
 
 fn preflight_no_compile(no_compile_flag: bool) -> bool {
@@ -135,22 +153,16 @@ fn preflight_no_compile(no_compile_flag: bool) -> bool {
     }
 }
 
-fn resolve_profile(cli: &Cli) -> Result<config::ResolvedProfile> {
-    let config_file = match cli.config.as_ref() {
+fn resolve_profile(
+    config_path: Option<&Path>,
+    inputs: ResolveInputs,
+) -> Result<config::ResolvedProfile> {
+    let config_file = match config_path {
         Some(path) => Some(config::load_required(path)?),
         None => config::load_optional(&config::default_config_path()?)?,
     };
 
-    config::resolve(
-        config_file.as_ref(),
-        config::ResolveInputs {
-            profile: cli.profile.clone(),
-            model: cli.model.clone(),
-            base_url: cli.base_url.clone(),
-            api_key: cli.api_key.clone(),
-            concurrency: cli.concurrency,
-        },
-    )
+    config::resolve(config_file.as_ref(), inputs)
 }
 
 fn save_translated_source(
@@ -188,27 +200,42 @@ fn compile_pdf_or_save_source(
     }
 
     eprintln!("[5/5] Compiling PDF...");
-    let compile_err = match compiler::compile(main_tex) {
-        Ok(pdf_path) => {
-            let output_path = match output {
-                Some(path) => path.to_path_buf(),
-                None => PathBuf::from(format!("{sanitized_id}_zh.pdf")),
-            };
-            std::fs::copy(&pdf_path, &output_path).with_context(|| {
-                format!(
-                    "Failed to copy PDF from {} to {}",
-                    pdf_path.display(),
-                    output_path.display()
-                )
-            })?;
-            eprintln!("Output: {}", output_path.display());
-            return Ok(());
+    let pdf_path = match compiler::compile(main_tex) {
+        Ok(p) => p,
+        Err(compile_err) => {
+            return Err(save_source_on_failure(
+                work_dir,
+                main_tex,
+                sanitized_id,
+                compile_err,
+            ));
         }
-        Err(e) => e,
     };
 
-    // Compilation failed — preserve the translated source so the
-    // user can recompile manually without re-paying for translation.
+    let output_path = match output {
+        Some(path) => path.to_path_buf(),
+        None => PathBuf::from(format!("{sanitized_id}_zh.pdf")),
+    };
+    std::fs::copy(&pdf_path, &output_path).with_context(|| {
+        format!(
+            "Failed to copy PDF from {} to {}",
+            pdf_path.display(),
+            output_path.display()
+        )
+    })?;
+    eprintln!("Output: {}", output_path.display());
+    Ok(())
+}
+
+/// Preserve the translated `.tex` source after a failed compile so the
+/// user can recompile manually without re-paying for translation.
+/// Returns the original compile error after reporting any source-save failure.
+fn save_source_on_failure(
+    work_dir: &Path,
+    main_tex: &Path,
+    sanitized_id: &str,
+    compile_err: anyhow::Error,
+) -> anyhow::Error {
     let fallback_dir = PathBuf::from(format!("{sanitized_id}_zh_tex"));
     if let Err(save_err) = utils::copy_dir_recursive(work_dir, &fallback_dir) {
         eprintln!(
@@ -216,7 +243,7 @@ fn compile_pdf_or_save_source(
             fallback_dir.display(),
             save_err,
         );
-        return Err(compile_err);
+        return compile_err;
     }
 
     let main_name = match main_tex.file_name() {
@@ -234,5 +261,5 @@ fn compile_pdf_or_save_source(
         fallback_dir.display(),
         main_name
     );
-    Err(compile_err)
+    compile_err
 }
