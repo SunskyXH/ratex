@@ -81,26 +81,17 @@ fn compile_tectonic(main_tex: &Path) -> Result<PathBuf> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // Show last meaningful error lines
-        let error_output: String = stderr
-            .lines()
-            .chain(stdout.lines())
-            .filter(|l| l.contains("error") || l.contains("Error") || l.starts_with('!'))
-            .take(15)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let error_output = tex_error_summary(&stdout, &stderr, 15);
 
         if !error_output.is_empty() {
-            bail!("tectonic compilation failed:\n{}", error_output);
+            bail!("tectonic compilation failed:\n{error_output}");
         }
-        bail!(
-            "tectonic compilation failed:\n{}\n{}",
-            stdout.chars().take(2000).collect::<String>(),
-            stderr.chars().take(2000).collect::<String>()
-        );
+        let stdout = truncate(&stdout, 2000);
+        let stderr = truncate(&stderr, 2000);
+        bail!("tectonic compilation failed:\n{stdout}\n{stderr}");
     }
 
-    let pdf_path = work_dir.join(format!("{}.pdf", stem));
+    let pdf_path = work_dir.join(format!("{stem}.pdf"));
     if !pdf_path.exists() {
         bail!("tectonic ran successfully but no PDF was generated.");
     }
@@ -130,7 +121,7 @@ fn compile_xelatex(main_tex: &Path) -> Result<PathBuf> {
     run_xelatex(work_dir, &tex_filename)?;
 
     // Run bibtex if .aux contains citations
-    let aux_path = work_dir.join(format!("{}.aux", stem));
+    let aux_path = work_dir.join(format!("{stem}.aux"));
     let needs_bibtex = if aux_path.exists() {
         let aux_content = std::fs::read_to_string(&aux_path).unwrap_or_default();
         aux_content.contains("\\citation") || aux_content.contains("\\bibdata")
@@ -140,10 +131,18 @@ fn compile_xelatex(main_tex: &Path) -> Result<PathBuf> {
 
     if needs_bibtex {
         eprintln!("  [bibtex] Running bibtex...");
-        let _ = Command::new("bibtex")
+        let output = Command::new("bibtex")
             .arg(stem.as_ref())
             .current_dir(work_dir)
-            .output();
+            .output()
+            .context("Failed to run bibtex")?;
+        if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = truncate(&stdout, 2000);
+            let stderr = truncate(&stderr, 2000);
+            bail!("bibtex failed:\n{stdout}\n{stderr}");
+        }
     }
 
     // Second + third xelatex passes
@@ -153,16 +152,13 @@ fn compile_xelatex(main_tex: &Path) -> Result<PathBuf> {
     eprintln!("  [3/3] Running xelatex (third pass)...");
     run_xelatex(work_dir, &tex_filename)?;
 
-    let pdf_path = work_dir.join(format!("{}.pdf", stem));
+    let pdf_path = work_dir.join(format!("{stem}.pdf"));
     if !pdf_path.exists() {
-        let log_path = work_dir.join(format!("{}.log", stem));
+        let log_path = work_dir.join(format!("{stem}.log"));
         if log_path.exists() {
             let log = std::fs::read_to_string(&log_path).unwrap_or_default();
             let last_lines: String = log.lines().rev().take(30).collect::<Vec<_>>().join("\n");
-            bail!(
-                "PDF was not generated. Last lines of xelatex log:\n{}",
-                last_lines
-            );
+            bail!("PDF was not generated. Last lines of xelatex log:\n{last_lines}");
         }
         bail!("PDF was not generated and no log file found.");
     }
@@ -179,19 +175,29 @@ fn run_xelatex(work_dir: &Path, tex_filename: &str) -> Result<()> {
 
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let error_lines: Vec<&str> = stdout
-            .lines()
-            .filter(|l| l.starts_with('!') || l.contains("Error"))
-            .take(10)
-            .collect();
-
-        if !error_lines.is_empty() {
-            eprintln!("  xelatex errors:");
-            for line in &error_lines {
-                eprintln!("    {}", line);
-            }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let error_output = tex_error_summary(&stdout, &stderr, 10);
+        if !error_output.is_empty() {
+            bail!("xelatex failed:\n{error_output}");
         }
+        let stdout = truncate(&stdout, 2000);
+        let stderr = truncate(&stderr, 2000);
+        bail!("xelatex failed:\n{stdout}\n{stderr}");
     }
 
     Ok(())
+}
+
+fn tex_error_summary(stdout: &str, stderr: &str, max_lines: usize) -> String {
+    stderr
+        .lines()
+        .chain(stdout.lines())
+        .filter(|line| line.starts_with('!') || line.contains("Error") || line.contains("error"))
+        .take(max_lines)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn truncate(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
 }

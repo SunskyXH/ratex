@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::config::{Protocol, ResolvedProfile};
 
-const SYSTEM_PROMPT: &str = r#"You are a professional academic translator. Translate the following LaTeX content from English to Chinese (Simplified Chinese).
+const SYSTEM_PROMPT: &str = r"You are a professional academic translator. Translate the following LaTeX content from English to Chinese (Simplified Chinese).
 
 Critical rules:
 1. Translate ONLY natural language text to Chinese.
@@ -19,7 +19,7 @@ Critical rules:
 3. Maintain the EXACT same LaTeX structure and formatting.
 4. Use proper Chinese academic writing style (学术论文风格).
 5. For well-known technical terms, use the Chinese term followed by English in parentheses on first occurrence.
-6. Output ONLY the translated LaTeX content. No explanations, no markdown code fences, no extra text."#;
+6. Output ONLY the translated LaTeX content. No explanations, no markdown code fences, no extra text.";
 
 /// LLM provider for translation.
 pub enum Provider {
@@ -58,7 +58,7 @@ impl Provider {
 fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(180))
+        .timeout(Duration::from_mins(3))
         .build()
         .expect("failed to build HTTP client")
 }
@@ -153,7 +153,7 @@ impl OpenAiProvider {
 
         let body = response.text().await?;
         if !status.is_success() {
-            bail!("OpenAI API error ({}): {}", status, body);
+            bail!("OpenAI API error ({status}): {body}");
         }
 
         let resp: OpenAiResponse =
@@ -250,7 +250,7 @@ impl GeminiProvider {
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
-            bail!("Gemini API error ({}): {}", status, body);
+            bail!("Gemini API error ({status}): {body}");
         }
 
         let resp: GeminiResponse =
@@ -264,8 +264,7 @@ impl GeminiProvider {
                     .parts
                     .into_iter()
                     .map(|p| p.text)
-                    .collect::<Vec<_>>()
-                    .join("")
+                    .collect::<String>()
             })
             .unwrap_or_default();
 
@@ -280,19 +279,20 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = reqwest::Result<reqwest::Response>>,
 {
-    let mut last_err = None;
-    for attempt in 0..3 {
+    const MAX_ATTEMPTS: u32 = 3;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let can_retry = attempt + 1 < MAX_ATTEMPTS;
         match make_request().await {
             Ok(resp) => {
                 let status = resp.status();
                 // Retry on rate limit or server errors
                 if (status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
-                    && attempt < 2
+                    && can_retry
                 {
-                    let delay = Duration::from_secs(2u64.pow(attempt as u32 + 1));
+                    let delay = retry_delay(attempt);
                     eprintln!(
-                        "  API returned {}, retrying in {}s...",
-                        status,
+                        "  API returned {status}, retrying in {}s...",
                         delay.as_secs()
                     );
                     tokio::time::sleep(delay).await;
@@ -301,22 +301,25 @@ where
                 return Ok(resp);
             }
             Err(e) => {
-                if attempt < 2 {
-                    let delay = Duration::from_secs(2u64.pow(attempt as u32 + 1));
+                if can_retry {
+                    let delay = retry_delay(attempt);
                     eprintln!(
                         "  Request failed ({}), retrying in {}s...",
                         redact_secrets(&e.to_string()),
                         delay.as_secs()
                     );
                     tokio::time::sleep(delay).await;
-                    last_err = Some(e);
                     continue;
                 }
                 return Err(e.into());
             }
         }
     }
-    Err(last_err.unwrap().into())
+    unreachable!("retry loop has a non-zero attempt count")
+}
+
+fn retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(2u64.pow(attempt + 1))
 }
 
 /// Strip query parameters that look like API keys (e.g. Gemini's `?key=...`)

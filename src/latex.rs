@@ -63,9 +63,7 @@ pub fn inline_missing_bibliography(main_tex: &Path) -> Result<bool> {
 
         // Don't touch this call if every referenced .bib is present —
         // bibtex will work normally and we shouldn't second-guess it.
-        let any_bib_missing = names
-            .iter()
-            .any(|n| !dir.join(format!("{}.bib", n)).exists());
+        let any_bib_missing = names.iter().any(|n| !dir.join(format!("{n}.bib")).exists());
         if !any_bib_missing {
             continue;
         }
@@ -75,7 +73,7 @@ pub fn inline_missing_bibliography(main_tex: &Path) -> Result<bool> {
         // as the main tex (arXiv's typical layout).
         let bbl = names
             .iter()
-            .map(|n| dir.join(format!("{}.bbl", n)))
+            .map(|n| dir.join(format!("{n}.bbl")))
             .find(|p| p.exists())
             .or_else(|| {
                 main_tex
@@ -92,8 +90,7 @@ pub fn inline_missing_bibliography(main_tex: &Path) -> Result<bool> {
 
         let replacement = format!(
             "% [ratex] no .bib found beside the source — inline pre-generated .bbl\n\
-             \\input{{{}}}",
-            bbl_filename
+             \\input{{{bbl_filename}}}"
         );
         new_content = new_content.replace(&full, &replacement);
         rewrote_any = true;
@@ -125,9 +122,9 @@ pub fn find_main_tex(tex_files: &[PathBuf]) -> Result<PathBuf> {
 /// Inject CJK support into the preamble of the main .tex file content.
 /// Also removes conflicting fontenc/inputenc packages and neutralizes
 /// pdfTeX-only directives that confuse hyperref's driver auto-detection
-/// when the file is compiled with XeTeX (Tectonic / xelatex).
+/// when the file is compiled with `XeTeX` (Tectonic / xelatex).
 pub fn add_cjk_support(content: &str) -> String {
-    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    let mut lines: Vec<String> = content.lines().map(ToString::to_string).collect();
     let mut insert_pos = None;
     let mut removals = Vec::new();
 
@@ -186,8 +183,8 @@ pub fn add_cjk_support(content: &str) -> String {
 /// Split content into translatable chunks at section/paragraph boundaries.
 ///
 /// The preamble (everything before \begin{document}) is NOT chunked for translation.
-fn split_into_chunks(body: &str, max_chars: usize) -> Vec<String> {
-    if body.len() <= max_chars {
+fn split_into_chunks(body: &str, max_bytes: usize) -> Vec<String> {
+    if body.len() <= max_bytes {
         return vec![body.to_string()];
     }
 
@@ -217,24 +214,24 @@ fn split_into_chunks(body: &str, max_chars: usize) -> Vec<String> {
     // Now split oversized sections at paragraph boundaries
     let mut chunks = Vec::new();
     for section in sections {
-        if section.len() <= max_chars {
+        if section.len() <= max_bytes {
             chunks.push(section);
-        } else {
-            // Split at paragraph boundaries (double newlines)
-            let mut current = String::new();
-            for paragraph in section.split("\n\n") {
-                if current.len() + paragraph.len() + 2 > max_chars && !current.is_empty() {
-                    chunks.push(current.clone());
-                    current.clear();
-                }
-                if !current.is_empty() {
-                    current.push_str("\n\n");
-                }
-                current.push_str(paragraph);
+            continue;
+        }
+
+        // Split at paragraph boundaries (double newlines)
+        let mut current = String::new();
+        for paragraph in section.split("\n\n") {
+            if current.len() + paragraph.len() + 2 > max_bytes && !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
             }
             if !current.is_empty() {
-                chunks.push(current);
+                current.push_str("\n\n");
             }
+            current.push_str(paragraph);
+        }
+        if !current.is_empty() {
+            chunks.push(current);
         }
     }
 
@@ -249,20 +246,19 @@ fn split_into_chunks(body: &str, max_chars: usize) -> Vec<String> {
 /// warning. On the first task error every other task is aborted and
 /// the error is propagated (fail-fast, same as chunk-level).
 pub async fn translate_all(
-    tex_files: &[PathBuf],
+    tex_files: Vec<PathBuf>,
     main_tex: &Path,
     provider: Arc<Provider>,
     semaphore: Arc<Semaphore>,
 ) -> Result<()> {
     let total = tex_files.len();
-    eprintln!("  Translating ({} files in parallel)...", total);
+    eprintln!("  Translating ({total} files in parallel)...");
 
-    let main_tex = Arc::new(main_tex.to_path_buf());
     let mut set: JoinSet<Result<Option<String>>> = JoinSet::new();
-    for tex_file in tex_files.iter().cloned() {
+    for tex_file in tex_files {
+        let is_main = tex_file.as_path() == main_tex;
         let provider = Arc::clone(&provider);
         let semaphore = Arc::clone(&semaphore);
-        let main_tex = Arc::clone(&main_tex);
         set.spawn(async move {
             let filename = tex_file
                 .file_name()
@@ -270,10 +266,10 @@ pub async fn translate_all(
                 .to_string_lossy()
                 .into_owned();
 
-            let content = match std::fs::read_to_string(&tex_file) {
+            let content = match tokio::fs::read_to_string(&tex_file).await {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("  Skipping {} (cannot read: {})", filename, e);
+                    eprintln!("  Skipping {filename} (cannot read: {e})");
                     return Ok(None);
                 }
             };
@@ -281,16 +277,16 @@ pub async fn translate_all(
                 return Ok(None);
             }
 
-            let is_main = tex_file == *main_tex;
             let label = if is_main {
-                format!("{} (main)", filename)
+                format!("{filename} (main)")
             } else {
                 filename.clone()
             };
             let translated =
                 translate_tex_file(&content, is_main, &provider, &semaphore, &label).await?;
-            std::fs::write(&tex_file, translated)
-                .with_context(|| format!("Failed to write translated {}", filename))?;
+            tokio::fs::write(&tex_file, translated)
+                .await
+                .with_context(|| format!("Failed to write translated {filename}"))?;
             Ok(Some(filename))
         });
     }
@@ -300,7 +296,7 @@ pub async fn translate_all(
         match joined {
             Ok(Ok(Some(filename))) => {
                 completed += 1;
-                eprintln!("  [{}/{}] {}", completed, total, filename);
+                eprintln!("  [{completed}/{total}] {filename}");
             }
             Ok(Ok(None)) => {
                 completed += 1;
@@ -311,7 +307,7 @@ pub async fn translate_all(
             }
             Err(e) => {
                 set.abort_all();
-                return Err(anyhow!("file translation task panicked: {}", e));
+                return Err(anyhow!("file translation task panicked: {e}"));
             }
         }
     }
@@ -403,7 +399,7 @@ async fn translate_chunks(
             Ok(Ok((i, text))) => {
                 completed += 1;
                 if total > 1 {
-                    eprintln!("  {}: chunk {}/{} done", label, completed, total);
+                    eprintln!("  {label}: chunk {completed}/{total} done");
                 }
                 results[i] = Some(text);
             }

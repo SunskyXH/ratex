@@ -118,7 +118,7 @@ where
     })?;
     let profile = cfg.profiles.get(name).ok_or_else(|| {
         let mut available: Vec<&str> = cfg.profiles.keys().map(String::as_str).collect();
-        available.sort();
+        available.sort_unstable();
         anyhow!(
             "Profile '{}' not found. Available: [{}]",
             name,
@@ -143,10 +143,7 @@ where
             .as_deref()
             .unwrap_or_else(|| default_api_key_env(profile.protocol));
         env(env_var).ok_or_else(|| {
-            anyhow!(
-                "API key not provided. Use --api-key or set {} environment variable.",
-                env_var
-            )
+            anyhow!("API key not provided. Use --api-key or set {env_var} environment variable.")
         })?
     };
 
@@ -190,9 +187,10 @@ fn default_api_key_env(p: Protocol) -> &'static str {
 }
 
 fn config_path_hint() -> String {
-    default_config_path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "~/.config/ratex/config.toml".into())
+    match default_config_path() {
+        Ok(path) => path.display().to_string(),
+        Err(_) => "~/.config/ratex/config.toml".into(),
+    }
 }
 
 #[cfg(test)]

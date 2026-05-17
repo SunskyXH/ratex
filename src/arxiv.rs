@@ -1,14 +1,14 @@
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use regex::Regex;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::Path;
 use tar::Archive;
 
 /// Parse an arXiv paper ID from a URL or bare ID.
 ///
 /// Accepts:
-/// - Full URLs: https://arxiv.org/abs/2301.00001, https://arxiv.org/pdf/2301.00001
+/// - Full URLs: <https://arxiv.org/abs/2301.00001>, <https://arxiv.org/pdf/2301.00001>
 /// - New-style IDs: 2301.00001, 2301.00001v2
 /// - Old-style IDs: hep-th/0601001, hep-th/0601001v2
 pub fn parse_id(input: &str) -> Result<String> {
@@ -33,14 +33,13 @@ pub fn parse_id(input: &str) -> Result<String> {
     }
 
     bail!(
-        "Cannot parse arXiv ID from '{}'. Expected a URL like https://arxiv.org/abs/2301.00001 or a bare ID like 2301.00001",
-        input
+        "Cannot parse arXiv ID from '{input}'. Expected a URL like https://arxiv.org/abs/2301.00001 or a bare ID like 2301.00001"
     )
 }
 
 /// Download and extract the arXiv e-print source into `dest`.
 pub async fn download_source(arxiv_id: &str, dest: &Path) -> Result<()> {
-    let url = format!("https://arxiv.org/e-print/{}", arxiv_id);
+    let url = format!("https://arxiv.org/e-print/{arxiv_id}");
 
     let client = reqwest::Client::builder()
         .user_agent("ratex/0.1 (academic paper translator)")
@@ -53,10 +52,7 @@ pub async fn download_source(arxiv_id: &str, dest: &Path) -> Result<()> {
         .context("Failed to connect to arXiv")?;
 
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        bail!(
-            "Paper '{}' not found on arXiv. Verify the paper ID.",
-            arxiv_id
-        );
+        bail!("Paper '{arxiv_id}' not found on arXiv. Verify the paper ID.");
     }
 
     let response = response
@@ -76,16 +72,83 @@ pub async fn download_source(arxiv_id: &str, dest: &Path) -> Result<()> {
         .context("Failed to decompress source (may not be gzipped)")?;
 
     // Try to extract as tar archive
-    let cursor = std::io::Cursor::new(&decompressed);
-    let mut archive = Archive::new(cursor);
+    if looks_like_tar(&decompressed) {
+        let cursor = Cursor::new(&decompressed);
+        let mut archive = Archive::new(cursor);
+        archive
+            .unpack(dest)
+            .context("Failed to unpack arXiv tar source")?;
+    } else {
+        // Not a tar archive: arXiv sometimes returns a gzipped single .tex file.
+        std::fs::write(dest.join("main.tex"), &decompressed)
+            .context("Failed to write extracted .tex file")?;
+    }
 
-    match archive.unpack(dest) {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            // Not a tar archive — treat as a single .tex file
-            std::fs::write(dest.join("main.tex"), &decompressed)
-                .context("Failed to write extracted .tex file")?;
-            Ok(())
-        }
+    Ok(())
+}
+
+fn looks_like_tar(bytes: &[u8]) -> bool {
+    const BLOCK_SIZE: usize = 512;
+    const CHECKSUM_START: usize = 148;
+    const CHECKSUM_END: usize = 156;
+
+    if bytes.len() < BLOCK_SIZE {
+        return false;
+    }
+
+    let header = &bytes[..BLOCK_SIZE];
+    if header.iter().all(|&b| b == 0) {
+        return true;
+    }
+
+    let Some(stored_checksum) = parse_tar_checksum(&header[CHECKSUM_START..CHECKSUM_END]) else {
+        return false;
+    };
+
+    // Checksum is computed as if the checksum field itself were ASCII spaces.
+    let computed_checksum: u32 = header[..CHECKSUM_START]
+        .iter()
+        .chain(&header[CHECKSUM_END..])
+        .chain(std::iter::repeat_n(&b' ', CHECKSUM_END - CHECKSUM_START))
+        .map(|&b| u32::from(b))
+        .sum();
+
+    stored_checksum == computed_checksum
+}
+
+fn parse_tar_checksum(field: &[u8]) -> Option<u32> {
+    let value = std::str::from_utf8(field).ok()?;
+    let value = value.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+    if value.is_empty() {
+        return None;
+    }
+
+    u32::from_str_radix(value, 8).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_tex_is_not_detected_as_tar() {
+        let tex =
+            "\\documentclass{article}\n\\begin{document}\nhello\n\\end{document}\n".repeat(50);
+        assert!(!looks_like_tar(tex.as_bytes()));
+    }
+
+    #[test]
+    fn valid_tar_header_is_detected() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        let content = b"hello";
+        header.set_size(content.len() as u64);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "main.tex", &content[..])
+            .unwrap();
+        let archive = builder.into_inner().unwrap();
+
+        assert!(looks_like_tar(&archive));
     }
 }
