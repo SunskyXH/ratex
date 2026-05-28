@@ -8,14 +8,18 @@ use tar::Archive;
 /// Parse an arXiv paper ID from a URL or bare ID.
 ///
 /// Accepts:
-/// - Full URLs: <https://arxiv.org/abs/2301.00001>, <https://arxiv.org/pdf/2301.00001>
+/// - Full URLs under `/abs/`, `/pdf/`, `/e-print/`, `/html/`, or `/format/`
+///   (the `.pdf` extension on `/pdf/` URLs is tolerated)
 /// - New-style IDs: 2301.00001, 2301.00001v2
 /// - Old-style IDs: hep-th/0601001, hep-th/0601001v2
 pub fn parse_id(input: &str) -> Result<String> {
     let input = input.trim().trim_end_matches('/');
 
-    // Handle full URLs
-    let url_re = Regex::new(r"arxiv\.org/(?:abs|pdf|e-print)/([^\s?#]+)")?;
+    // Anchor on the ID shape inside the URL so trailing `.pdf`, subpaths, or
+    // query strings don't get captured.
+    let url_re = Regex::new(
+        r"arxiv\.org/(?:abs|pdf|e-print|html|format)/((?:[a-z-]+/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?)",
+    )?;
     if let Some(caps) = url_re.captures(input) {
         return Ok(caps[1].to_string());
     }
@@ -129,6 +133,79 @@ fn parse_tar_checksum(field: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_abs_url() {
+        assert_eq!(
+            parse_id("https://arxiv.org/abs/2301.00001").unwrap(),
+            "2301.00001"
+        );
+    }
+
+    #[test]
+    fn parses_pdf_url() {
+        assert_eq!(
+            parse_id("https://arxiv.org/pdf/2602.21340").unwrap(),
+            "2602.21340"
+        );
+    }
+
+    #[test]
+    fn parses_pdf_url_with_pdf_extension() {
+        assert_eq!(
+            parse_id("https://arxiv.org/pdf/2602.21340.pdf").unwrap(),
+            "2602.21340"
+        );
+    }
+
+    #[test]
+    fn parses_html_url_with_version() {
+        assert_eq!(
+            parse_id("https://arxiv.org/html/2510.26912v1").unwrap(),
+            "2510.26912v1"
+        );
+    }
+
+    #[test]
+    fn parses_e_print_url() {
+        assert_eq!(
+            parse_id("https://arxiv.org/e-print/2301.00001v3").unwrap(),
+            "2301.00001v3"
+        );
+    }
+
+    #[test]
+    fn parses_old_style_url() {
+        assert_eq!(
+            parse_id("https://arxiv.org/abs/hep-th/0601001v2").unwrap(),
+            "hep-th/0601001v2"
+        );
+    }
+
+    #[test]
+    fn parses_bare_new_style_id() {
+        assert_eq!(parse_id("2510.26912").unwrap(), "2510.26912");
+        assert_eq!(parse_id("2510.26912v1").unwrap(), "2510.26912v1");
+    }
+
+    #[test]
+    fn parses_bare_old_style_id() {
+        assert_eq!(parse_id("hep-th/0601001").unwrap(), "hep-th/0601001");
+    }
+
+    #[test]
+    fn url_with_trailing_slash() {
+        assert_eq!(
+            parse_id("https://arxiv.org/html/2510.26912v1/").unwrap(),
+            "2510.26912v1"
+        );
+    }
+
+    #[test]
+    fn rejects_garbage_input() {
+        assert!(parse_id("not-an-arxiv-id").is_err());
+        assert!(parse_id("https://example.com/abs/2301.00001").is_err());
+    }
 
     #[test]
     fn plain_tex_is_not_detected_as_tar() {
