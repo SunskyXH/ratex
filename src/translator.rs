@@ -338,8 +338,8 @@ impl ClaudeCliProvider {
             );
         }
 
-        let text = String::from_utf8(output.stdout)
-            .context("Claude CLI returned non-UTF-8 output")?;
+        let text =
+            String::from_utf8(output.stdout).context("Claude CLI returned non-UTF-8 output")?;
         Ok(strip_code_fences(&text))
     }
 }
