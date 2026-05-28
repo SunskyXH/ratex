@@ -17,12 +17,14 @@ pub fn parse_id(input: &str) -> Result<String> {
     let input = input.trim().trim_end_matches('/');
 
     // Anchor to the start of the input so `notarxiv.org/...` and
-    // `xhttps://arxiv.org/...` don't sneak through. The trailing
+    // `xhttps://arxiv.org/...` don't sneak through. Scheme + host are matched
+    // case-insensitively (`https://arXiv.org/...` is a real-world citation
+    // form), the path stays case-sensitive. The trailing
     // `(?:\.pdf)?(?:[/?#]|$)` requires a real boundary after the ID, so junk
     // like `2602.21340vfoo` or `2301.00001extra` won't be silently truncated
     // to a valid-looking ID.
     let url_re = Regex::new(
-        r"^(?:https?://)?(?:www\.)?arxiv\.org/(?:abs|pdf|e-print|html|format)/((?:[a-z-]+(?:\.[A-Za-z-]+)?/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?)(?:\.pdf)?(?:[/?#]|$)",
+        r"^(?i:(?:https?://)?(?:www\.)?arxiv\.org)/(?:abs|pdf|e-print|html|format)/((?:[a-z-]+(?:\.[A-Za-z-]+)?/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?)(?:\.pdf)?(?:[/?#]|$)",
     )?;
     if let Some(caps) = url_re.captures(input) {
         return Ok(caps[1].to_string());
@@ -262,6 +264,23 @@ mod tests {
             "2301.00001"
         );
         assert_eq!(parse_id("arxiv.org/abs/2301.00001").unwrap(), "2301.00001");
+    }
+
+    #[test]
+    fn scheme_and_host_are_case_insensitive() {
+        // `arXiv.org` is a real-world citation form.
+        assert_eq!(
+            parse_id("https://arXiv.org/abs/2301.00001").unwrap(),
+            "2301.00001"
+        );
+        assert_eq!(
+            parse_id("HTTP://ARXIV.ORG/abs/2301.00001").unwrap(),
+            "2301.00001"
+        );
+        assert_eq!(
+            parse_id("https://WWW.arxiv.org/html/2510.26912v1").unwrap(),
+            "2510.26912v1"
+        );
     }
 
     #[test]
