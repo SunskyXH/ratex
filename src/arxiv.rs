@@ -4,47 +4,109 @@ use regex::Regex;
 use std::io::{Cursor, Read};
 use std::path::Path;
 use tar::Archive;
+use url::Url;
+
+const URL_PATH_PREFIXES: &[&str] = &["abs", "pdf", "e-print", "html", "format"];
 
 /// Parse an arXiv paper ID from a URL or bare ID.
 ///
 /// Accepts:
 /// - Full URLs under `/abs/`, `/pdf/`, `/e-print/`, `/html/`, or `/format/`
-///   (a trailing `.pdf` is tolerated; subpaths and query strings are not
-///   silently absorbed into the ID)
+///   (a trailing `.pdf` is tolerated; URL scheme/host are case-insensitive)
 /// - New-style IDs: 2301.00001, 2301.00001v2
 /// - Old-style IDs: hep-th/0601001, math.GT/0309136v1, cond-mat.mes-hall/0601001
 pub fn parse_id(input: &str) -> Result<String> {
     let input = input.trim().trim_end_matches('/');
 
-    // Anchor to the start of the input so `notarxiv.org/...` and
-    // `xhttps://arxiv.org/...` don't sneak through. Scheme + host are matched
-    // case-insensitively (`https://arXiv.org/...` is a real-world citation
-    // form), the path stays case-sensitive. The trailing
-    // `(?:\.pdf)?(?:[/?#]|$)` requires a real boundary after the ID, so junk
-    // like `2602.21340vfoo` or `2301.00001extra` won't be silently truncated
-    // to a valid-looking ID.
-    let url_re = Regex::new(
-        r"^(?i:(?:https?://)?(?:www\.)?arxiv\.org)/(?:abs|pdf|e-print|html|format)/((?:[a-z-]+(?:\.[A-Za-z-]+)?/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?)(?:\.pdf)?(?:[/?#]|$)",
-    )?;
-    if let Some(caps) = url_re.captures(input) {
-        return Ok(caps[1].to_string());
+    if looks_like_url(input) {
+        return parse_url(input);
     }
 
-    // Bare new-style ID: 2301.00001 or 2301.00001v2
-    let new_re = Regex::new(r"^\d{4}\.\d{4,5}(?:v\d+)?$")?;
-    if new_re.is_match(input) {
-        return Ok(input.to_string());
-    }
-
-    // Bare old-style ID: hep-th/0601001, math.GT/0309136v1, cond-mat.mes-hall/0601001v2
-    let old_re = Regex::new(r"^[a-z-]+(?:\.[A-Za-z-]+)?/\d{7}(?:v\d+)?$")?;
-    if old_re.is_match(input) {
+    if id_is_valid(input) {
         return Ok(input.to_string());
     }
 
     bail!(
         "Cannot parse arXiv ID from '{input}'. Expected a URL like https://arxiv.org/abs/2301.00001 or a bare ID like 2301.00001"
     )
+}
+
+/// Heuristic: anything with a `://` or starting with the arxiv hostname is
+/// treated as URL input. Bare IDs (`2301.00001`, `hep-th/0601001`) fall
+/// through.
+fn looks_like_url(input: &str) -> bool {
+    if input.contains("://") {
+        return true;
+    }
+    let lower = input.to_ascii_lowercase();
+    lower.starts_with("arxiv.org/") || lower.starts_with("www.arxiv.org/")
+}
+
+fn parse_url(input: &str) -> Result<String> {
+    // `url::Url` requires a scheme. Add a default one for bare-host inputs
+    // like `arxiv.org/abs/...` so the parser can do its job.
+    let normalized = if input.contains("://") {
+        input.to_string()
+    } else {
+        format!("https://{input}")
+    };
+
+    let url = Url::parse(&normalized).with_context(|| format!("Invalid URL: {input}"))?;
+
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!(
+            "Unsupported URL scheme '{}': expected http or https",
+            url.scheme()
+        );
+    }
+
+    // `host_str()` returns the percent-decoded, lowercased host.
+    let host = url
+        .host_str()
+        .with_context(|| format!("URL has no host: {input}"))?;
+    if host != "arxiv.org" && host != "www.arxiv.org" {
+        bail!("Not an arXiv URL: host is '{host}'");
+    }
+
+    let mut segments = url
+        .path_segments()
+        .with_context(|| format!("URL has no path: {input}"))?
+        .filter(|s| !s.is_empty());
+
+    let kind = segments
+        .next()
+        .context("URL path is empty (expected /abs/, /pdf/, /e-print/, /html/, or /format/)")?;
+    if !URL_PATH_PREFIXES.contains(&kind) {
+        bail!(
+            "Unsupported arXiv path '/{kind}/': expected one of {}",
+            URL_PATH_PREFIXES.join(", ")
+        );
+    }
+
+    // ID may span one or two segments (`2301.00001` vs `hep-th/0601001`).
+    let rest: Vec<&str> = segments.collect();
+    if rest.is_empty() {
+        bail!("URL has no paper ID");
+    }
+    let mut candidate = rest.join("/");
+    if let Some(stripped) = candidate.strip_suffix(".pdf") {
+        candidate.truncate(stripped.len());
+    }
+
+    if !id_is_valid(&candidate) {
+        bail!("'{candidate}' doesn't look like an arXiv ID");
+    }
+    Ok(candidate)
+}
+
+/// True if `s` matches one of the two arXiv ID shapes (with an optional
+/// `vN` version suffix). New-style is `YYMM.NNNNN`, old-style is
+/// `archive[.subject]/YYMMNNN`.
+fn id_is_valid(s: &str) -> bool {
+    // OnceLock would avoid recompiling, but parse_id is called once per run.
+    let new_re = Regex::new(r"^\d{4}\.\d{4,5}(?:v\d+)?$").expect("valid regex");
+    let old_re = Regex::new(r"^[a-z-]+(?:\.[A-Za-z-]+)?/\d{7}(?:v\d+)?$").expect("valid regex");
+    new_re.is_match(s) || old_re.is_match(s)
 }
 
 /// Download and extract the arXiv e-print source into `dest`.
