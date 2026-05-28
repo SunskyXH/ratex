@@ -300,7 +300,11 @@ impl ClaudeCliProvider {
             .arg(SYSTEM_PROMPT)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Make sure a timeout (which drops the wait future and hence the
+            // Child) actually kills the subprocess. Tokio's default is to
+            // leave it running.
+            .kill_on_drop(true);
 
         if !self.model.is_empty() {
             cmd.args(["--model", &self.model]);

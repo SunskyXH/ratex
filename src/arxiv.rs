@@ -9,29 +9,31 @@ use tar::Archive;
 ///
 /// Accepts:
 /// - Full URLs under `/abs/`, `/pdf/`, `/e-print/`, `/html/`, or `/format/`
-///   (the `.pdf` extension on `/pdf/` URLs is tolerated)
+///   (a trailing `.pdf` is tolerated; subpaths and query strings are not
+///   silently absorbed into the ID)
 /// - New-style IDs: 2301.00001, 2301.00001v2
-/// - Old-style IDs: hep-th/0601001, hep-th/0601001v2
+/// - Old-style IDs: hep-th/0601001, math.GT/0309136v1, cond-mat.mes-hall/0601001
 pub fn parse_id(input: &str) -> Result<String> {
     let input = input.trim().trim_end_matches('/');
 
-    // Anchor on the ID shape inside the URL so trailing `.pdf`, subpaths, or
-    // query strings don't get captured.
+    // ID shape inside an arxiv.org URL. The trailing `(?:\.pdf)?(?:[/?#]|$)`
+    // requires a real boundary after the ID, so junk like `2602.21340vfoo`
+    // or `2301.00001extra` won't be silently truncated to a valid-looking ID.
     let url_re = Regex::new(
-        r"arxiv\.org/(?:abs|pdf|e-print|html|format)/((?:[a-z-]+/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?)",
+        r"arxiv\.org/(?:abs|pdf|e-print|html|format)/((?:[a-z-]+(?:\.[A-Za-z-]+)?/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?)(?:\.pdf)?(?:[/?#]|$)",
     )?;
     if let Some(caps) = url_re.captures(input) {
         return Ok(caps[1].to_string());
     }
 
-    // Handle bare new-style IDs: 2301.00001 or 2301.00001v2
-    let new_re = Regex::new(r"^(\d{4}\.\d{4,5})(v\d+)?$")?;
+    // Bare new-style ID: 2301.00001 or 2301.00001v2
+    let new_re = Regex::new(r"^\d{4}\.\d{4,5}(?:v\d+)?$")?;
     if new_re.is_match(input) {
         return Ok(input.to_string());
     }
 
-    // Handle bare old-style IDs: hep-th/0601001 or hep-th/0601001v2
-    let old_re = Regex::new(r"^([a-z-]+/\d{7})(v\d+)?$")?;
+    // Bare old-style ID: hep-th/0601001, math.GT/0309136v1, cond-mat.mes-hall/0601001v2
+    let old_re = Regex::new(r"^[a-z-]+(?:\.[A-Za-z-]+)?/\d{7}(?:v\d+)?$")?;
     if old_re.is_match(input) {
         return Ok(input.to_string());
     }
@@ -179,6 +181,39 @@ mod tests {
         assert_eq!(
             parse_id("https://arxiv.org/abs/hep-th/0601001v2").unwrap(),
             "hep-th/0601001v2"
+        );
+    }
+
+    #[test]
+    fn parses_old_style_with_subject_class() {
+        assert_eq!(
+            parse_id("https://arxiv.org/abs/math.GT/0309136").unwrap(),
+            "math.GT/0309136"
+        );
+        assert_eq!(
+            parse_id("https://arxiv.org/abs/cond-mat.mes-hall/0601001v2").unwrap(),
+            "cond-mat.mes-hall/0601001v2"
+        );
+        assert_eq!(parse_id("math.GT/0309136").unwrap(), "math.GT/0309136");
+    }
+
+    #[test]
+    fn rejects_id_with_trailing_junk() {
+        // Without the boundary anchor, these would silently truncate to
+        // 2602.21340 / 2301.00001.
+        assert!(parse_id("https://arxiv.org/pdf/2602.21340vfoo").is_err());
+        assert!(parse_id("https://arxiv.org/abs/2301.00001extra").is_err());
+    }
+
+    #[test]
+    fn url_with_query_or_fragment_still_parses() {
+        assert_eq!(
+            parse_id("https://arxiv.org/abs/2301.00001?context=foo").unwrap(),
+            "2301.00001"
+        );
+        assert_eq!(
+            parse_id("https://arxiv.org/html/2510.26912v1#section.2").unwrap(),
+            "2510.26912v1"
         );
     }
 
