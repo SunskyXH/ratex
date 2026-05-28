@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 pub enum Protocol {
     OpenAi,
     Gemini,
+    /// Shell out to the Claude Code CLI (`claude -p`) — no API key required,
+    /// auth comes from the user's local `claude` installation.
+    Claude,
 }
 
 impl Protocol {
@@ -16,7 +19,13 @@ impl Protocol {
         match self {
             Protocol::OpenAi => "openai",
             Protocol::Gemini => "gemini",
+            Protocol::Claude => "claude",
         }
+    }
+
+    /// Does this protocol need an API key from the environment?
+    fn needs_api_key(self) -> bool {
+        matches!(self, Protocol::OpenAi | Protocol::Gemini)
     }
 }
 
@@ -137,6 +146,8 @@ where
 
     let api_key = if let Some(k) = cli.api_key {
         k
+    } else if !profile.protocol.needs_api_key() {
+        String::new()
     } else {
         let env_var = profile
             .api_key_env
@@ -169,6 +180,8 @@ fn default_endpoint(p: Protocol) -> &'static str {
     match p {
         Protocol::OpenAi => "https://api.openai.com/v1",
         Protocol::Gemini => "https://generativelanguage.googleapis.com",
+        // For Claude CLI, `endpoint` doubles as the binary path on PATH.
+        Protocol::Claude => "claude",
     }
 }
 
@@ -176,6 +189,8 @@ fn default_model(p: Protocol) -> &'static str {
     match p {
         Protocol::OpenAi => "gpt-4o",
         Protocol::Gemini => "gemini-3-flash-preview",
+        // Empty means: don't pass `--model`; let the Claude CLI pick its default.
+        Protocol::Claude => "",
     }
 }
 
@@ -183,6 +198,8 @@ fn default_api_key_env(p: Protocol) -> &'static str {
     match p {
         Protocol::OpenAi => "OPENAI_API_KEY",
         Protocol::Gemini => "GEMINI_API_KEY",
+        // Unused for Claude (gated by `needs_api_key`), kept for exhaustiveness.
+        Protocol::Claude => "",
     }
 }
 
