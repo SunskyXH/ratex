@@ -16,11 +16,13 @@ use tar::Archive;
 pub fn parse_id(input: &str) -> Result<String> {
     let input = input.trim().trim_end_matches('/');
 
-    // ID shape inside an arxiv.org URL. The trailing `(?:\.pdf)?(?:[/?#]|$)`
-    // requires a real boundary after the ID, so junk like `2602.21340vfoo`
-    // or `2301.00001extra` won't be silently truncated to a valid-looking ID.
+    // Anchor to the start of the input so `notarxiv.org/...` and
+    // `xhttps://arxiv.org/...` don't sneak through. The trailing
+    // `(?:\.pdf)?(?:[/?#]|$)` requires a real boundary after the ID, so junk
+    // like `2602.21340vfoo` or `2301.00001extra` won't be silently truncated
+    // to a valid-looking ID.
     let url_re = Regex::new(
-        r"arxiv\.org/(?:abs|pdf|e-print|html|format)/((?:[a-z-]+(?:\.[A-Za-z-]+)?/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?)(?:\.pdf)?(?:[/?#]|$)",
+        r"^(?:https?://)?(?:www\.)?arxiv\.org/(?:abs|pdf|e-print|html|format)/((?:[a-z-]+(?:\.[A-Za-z-]+)?/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?)(?:\.pdf)?(?:[/?#]|$)",
     )?;
     if let Some(caps) = url_re.captures(input) {
         return Ok(caps[1].to_string());
@@ -240,6 +242,26 @@ mod tests {
     fn rejects_garbage_input() {
         assert!(parse_id("not-an-arxiv-id").is_err());
         assert!(parse_id("https://example.com/abs/2301.00001").is_err());
+    }
+
+    #[test]
+    fn rejects_look_alike_hosts() {
+        assert!(parse_id("https://notarxiv.org/abs/2301.00001").is_err());
+        assert!(parse_id("xhttps://arxiv.org/abs/2301.00001").is_err());
+        assert!(parse_id("evil.com/arxiv.org/abs/2301.00001").is_err());
+    }
+
+    #[test]
+    fn accepts_protocol_and_www_variants() {
+        assert_eq!(
+            parse_id("http://arxiv.org/abs/2301.00001").unwrap(),
+            "2301.00001"
+        );
+        assert_eq!(
+            parse_id("https://www.arxiv.org/abs/2301.00001").unwrap(),
+            "2301.00001"
+        );
+        assert_eq!(parse_id("arxiv.org/abs/2301.00001").unwrap(), "2301.00001");
     }
 
     #[test]
