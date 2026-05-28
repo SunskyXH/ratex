@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 
 use crate::config::{Protocol, ResolvedProfile};
 
@@ -25,6 +28,7 @@ Critical rules:
 pub enum Provider {
     OpenAi(OpenAiProvider),
     Gemini(GeminiProvider),
+    Claude(ClaudeCliProvider),
 }
 
 impl Provider {
@@ -42,6 +46,10 @@ impl Provider {
                 base_url: profile.endpoint.clone(),
                 model: profile.model.clone(),
             }),
+            Protocol::Claude => Provider::Claude(ClaudeCliProvider {
+                bin: profile.endpoint.clone(),
+                model: profile.model.clone(),
+            }),
         }
     }
 
@@ -49,6 +57,7 @@ impl Provider {
         match self {
             Provider::OpenAi(p) => p.translate(content).await,
             Provider::Gemini(p) => p.translate(content).await,
+            Provider::Claude(p) => p.translate(content).await,
         }
     }
 }
@@ -268,6 +277,73 @@ impl GeminiProvider {
             })
             .unwrap_or_default();
 
+        Ok(strip_code_fences(&text))
+    }
+}
+
+// ─── Claude CLI ──────────────────────────────────────────────────────────────
+
+/// Shells out to the Claude Code CLI (`claude -p`). Auth comes from the user's
+/// local `claude` setup — no API key threaded through this codebase.
+pub struct ClaudeCliProvider {
+    /// Path to the `claude` binary, or just `"claude"` to use PATH.
+    bin: String,
+    /// Optional model override. Empty → don't pass `--model`.
+    model: String,
+}
+
+impl ClaudeCliProvider {
+    async fn translate(&self, content: &str) -> Result<String> {
+        let mut cmd = Command::new(&self.bin);
+        cmd.arg("--print")
+            .arg("--append-system-prompt")
+            .arg(SYSTEM_PROMPT)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // Make sure a timeout (which drops the wait future and hence the
+            // Child) actually kills the subprocess. Tokio's default is to
+            // leave it running.
+            .kill_on_drop(true);
+
+        if !self.model.is_empty() {
+            cmd.args(["--model", &self.model]);
+        }
+
+        let mut child = cmd.spawn().with_context(|| {
+            format!(
+                "Failed to spawn '{}'. Is the Claude CLI installed and on PATH?",
+                self.bin
+            )
+        })?;
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("Claude CLI stdin pipe was not opened")?;
+        stdin
+            .write_all(content.as_bytes())
+            .await
+            .context("Failed to write content to Claude CLI stdin")?;
+        // Close stdin so claude sees EOF and starts processing.
+        drop(stdin);
+
+        let output = tokio::time::timeout(Duration::from_mins(5), child.wait_with_output())
+            .await
+            .context("Claude CLI timed out after 5 minutes")?
+            .context("Failed to wait for Claude CLI")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "Claude CLI exited with status {}: {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+
+        let text =
+            String::from_utf8(output.stdout).context("Claude CLI returned non-UTF-8 output")?;
         Ok(strip_code_fences(&text))
     }
 }

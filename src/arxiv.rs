@@ -4,37 +4,109 @@ use regex::Regex;
 use std::io::{Cursor, Read};
 use std::path::Path;
 use tar::Archive;
+use url::Url;
+
+const URL_PATH_PREFIXES: &[&str] = &["abs", "pdf", "e-print", "html", "format"];
 
 /// Parse an arXiv paper ID from a URL or bare ID.
 ///
 /// Accepts:
-/// - Full URLs: <https://arxiv.org/abs/2301.00001>, <https://arxiv.org/pdf/2301.00001>
+/// - Full URLs under `/abs/`, `/pdf/`, `/e-print/`, `/html/`, or `/format/`
+///   (a trailing `.pdf` is tolerated; URL scheme/host are case-insensitive)
 /// - New-style IDs: 2301.00001, 2301.00001v2
-/// - Old-style IDs: hep-th/0601001, hep-th/0601001v2
+/// - Old-style IDs: hep-th/0601001, math.GT/0309136v1, cond-mat.mes-hall/0601001
 pub fn parse_id(input: &str) -> Result<String> {
     let input = input.trim().trim_end_matches('/');
 
-    // Handle full URLs
-    let url_re = Regex::new(r"arxiv\.org/(?:abs|pdf|e-print)/([^\s?#]+)")?;
-    if let Some(caps) = url_re.captures(input) {
-        return Ok(caps[1].to_string());
+    if looks_like_url(input) {
+        return parse_url(input);
     }
 
-    // Handle bare new-style IDs: 2301.00001 or 2301.00001v2
-    let new_re = Regex::new(r"^(\d{4}\.\d{4,5})(v\d+)?$")?;
-    if new_re.is_match(input) {
-        return Ok(input.to_string());
-    }
-
-    // Handle bare old-style IDs: hep-th/0601001 or hep-th/0601001v2
-    let old_re = Regex::new(r"^([a-z-]+/\d{7})(v\d+)?$")?;
-    if old_re.is_match(input) {
+    if id_is_valid(input) {
         return Ok(input.to_string());
     }
 
     bail!(
         "Cannot parse arXiv ID from '{input}'. Expected a URL like https://arxiv.org/abs/2301.00001 or a bare ID like 2301.00001"
     )
+}
+
+/// Heuristic: anything with a `://` or starting with the arxiv hostname is
+/// treated as URL input. Bare IDs (`2301.00001`, `hep-th/0601001`) fall
+/// through.
+fn looks_like_url(input: &str) -> bool {
+    if input.contains("://") {
+        return true;
+    }
+    let lower = input.to_ascii_lowercase();
+    lower.starts_with("arxiv.org/") || lower.starts_with("www.arxiv.org/")
+}
+
+fn parse_url(input: &str) -> Result<String> {
+    // `url::Url` requires a scheme. Add a default one for bare-host inputs
+    // like `arxiv.org/abs/...` so the parser can do its job.
+    let normalized = if input.contains("://") {
+        input.to_string()
+    } else {
+        format!("https://{input}")
+    };
+
+    let url = Url::parse(&normalized).with_context(|| format!("Invalid URL: {input}"))?;
+
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!(
+            "Unsupported URL scheme '{}': expected http or https",
+            url.scheme()
+        );
+    }
+
+    // `host_str()` returns the percent-decoded, lowercased host.
+    let host = url
+        .host_str()
+        .with_context(|| format!("URL has no host: {input}"))?;
+    if host != "arxiv.org" && host != "www.arxiv.org" {
+        bail!("Not an arXiv URL: host is '{host}'");
+    }
+
+    let mut segments = url
+        .path_segments()
+        .with_context(|| format!("URL has no path: {input}"))?
+        .filter(|s| !s.is_empty());
+
+    let kind = segments
+        .next()
+        .context("URL path is empty (expected /abs/, /pdf/, /e-print/, /html/, or /format/)")?;
+    if !URL_PATH_PREFIXES.contains(&kind) {
+        bail!(
+            "Unsupported arXiv path '/{kind}/': expected one of {}",
+            URL_PATH_PREFIXES.join(", ")
+        );
+    }
+
+    // ID may span one or two segments (`2301.00001` vs `hep-th/0601001`).
+    let rest: Vec<&str> = segments.collect();
+    if rest.is_empty() {
+        bail!("URL has no paper ID");
+    }
+    let mut candidate = rest.join("/");
+    if let Some(stripped) = candidate.strip_suffix(".pdf") {
+        candidate.truncate(stripped.len());
+    }
+
+    if !id_is_valid(&candidate) {
+        bail!("'{candidate}' doesn't look like an arXiv ID");
+    }
+    Ok(candidate)
+}
+
+/// True if `s` matches one of the two arXiv ID shapes (with an optional
+/// `vN` version suffix). New-style is `YYMM.NNNNN`, old-style is
+/// `archive[.subject]/YYMMNNN`.
+fn id_is_valid(s: &str) -> bool {
+    // OnceLock would avoid recompiling, but parse_id is called once per run.
+    let new_re = Regex::new(r"^\d{4}\.\d{4,5}(?:v\d+)?$").expect("valid regex");
+    let old_re = Regex::new(r"^[a-z-]+(?:\.[A-Za-z-]+)?/\d{7}(?:v\d+)?$").expect("valid regex");
+    new_re.is_match(s) || old_re.is_match(s)
 }
 
 /// Download and extract the arXiv e-print source into `dest`.
@@ -129,6 +201,149 @@ fn parse_tar_checksum(field: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_abs_url() {
+        assert_eq!(
+            parse_id("https://arxiv.org/abs/2301.00001").unwrap(),
+            "2301.00001"
+        );
+    }
+
+    #[test]
+    fn parses_pdf_url() {
+        assert_eq!(
+            parse_id("https://arxiv.org/pdf/2602.21340").unwrap(),
+            "2602.21340"
+        );
+    }
+
+    #[test]
+    fn parses_pdf_url_with_pdf_extension() {
+        assert_eq!(
+            parse_id("https://arxiv.org/pdf/2602.21340.pdf").unwrap(),
+            "2602.21340"
+        );
+    }
+
+    #[test]
+    fn parses_html_url_with_version() {
+        assert_eq!(
+            parse_id("https://arxiv.org/html/2510.26912v1").unwrap(),
+            "2510.26912v1"
+        );
+    }
+
+    #[test]
+    fn parses_e_print_url() {
+        assert_eq!(
+            parse_id("https://arxiv.org/e-print/2301.00001v3").unwrap(),
+            "2301.00001v3"
+        );
+    }
+
+    #[test]
+    fn parses_old_style_url() {
+        assert_eq!(
+            parse_id("https://arxiv.org/abs/hep-th/0601001v2").unwrap(),
+            "hep-th/0601001v2"
+        );
+    }
+
+    #[test]
+    fn parses_old_style_with_subject_class() {
+        assert_eq!(
+            parse_id("https://arxiv.org/abs/math.GT/0309136").unwrap(),
+            "math.GT/0309136"
+        );
+        assert_eq!(
+            parse_id("https://arxiv.org/abs/cond-mat.mes-hall/0601001v2").unwrap(),
+            "cond-mat.mes-hall/0601001v2"
+        );
+        assert_eq!(parse_id("math.GT/0309136").unwrap(), "math.GT/0309136");
+    }
+
+    #[test]
+    fn rejects_id_with_trailing_junk() {
+        // Without the boundary anchor, these would silently truncate to
+        // 2602.21340 / 2301.00001.
+        assert!(parse_id("https://arxiv.org/pdf/2602.21340vfoo").is_err());
+        assert!(parse_id("https://arxiv.org/abs/2301.00001extra").is_err());
+    }
+
+    #[test]
+    fn url_with_query_or_fragment_still_parses() {
+        assert_eq!(
+            parse_id("https://arxiv.org/abs/2301.00001?context=foo").unwrap(),
+            "2301.00001"
+        );
+        assert_eq!(
+            parse_id("https://arxiv.org/html/2510.26912v1#section.2").unwrap(),
+            "2510.26912v1"
+        );
+    }
+
+    #[test]
+    fn parses_bare_new_style_id() {
+        assert_eq!(parse_id("2510.26912").unwrap(), "2510.26912");
+        assert_eq!(parse_id("2510.26912v1").unwrap(), "2510.26912v1");
+    }
+
+    #[test]
+    fn parses_bare_old_style_id() {
+        assert_eq!(parse_id("hep-th/0601001").unwrap(), "hep-th/0601001");
+    }
+
+    #[test]
+    fn url_with_trailing_slash() {
+        assert_eq!(
+            parse_id("https://arxiv.org/html/2510.26912v1/").unwrap(),
+            "2510.26912v1"
+        );
+    }
+
+    #[test]
+    fn rejects_garbage_input() {
+        assert!(parse_id("not-an-arxiv-id").is_err());
+        assert!(parse_id("https://example.com/abs/2301.00001").is_err());
+    }
+
+    #[test]
+    fn rejects_look_alike_hosts() {
+        assert!(parse_id("https://notarxiv.org/abs/2301.00001").is_err());
+        assert!(parse_id("xhttps://arxiv.org/abs/2301.00001").is_err());
+        assert!(parse_id("evil.com/arxiv.org/abs/2301.00001").is_err());
+    }
+
+    #[test]
+    fn accepts_protocol_and_www_variants() {
+        assert_eq!(
+            parse_id("http://arxiv.org/abs/2301.00001").unwrap(),
+            "2301.00001"
+        );
+        assert_eq!(
+            parse_id("https://www.arxiv.org/abs/2301.00001").unwrap(),
+            "2301.00001"
+        );
+        assert_eq!(parse_id("arxiv.org/abs/2301.00001").unwrap(), "2301.00001");
+    }
+
+    #[test]
+    fn scheme_and_host_are_case_insensitive() {
+        // `arXiv.org` is a real-world citation form.
+        assert_eq!(
+            parse_id("https://arXiv.org/abs/2301.00001").unwrap(),
+            "2301.00001"
+        );
+        assert_eq!(
+            parse_id("HTTP://ARXIV.ORG/abs/2301.00001").unwrap(),
+            "2301.00001"
+        );
+        assert_eq!(
+            parse_id("https://WWW.arxiv.org/html/2510.26912v1").unwrap(),
+            "2510.26912v1"
+        );
+    }
 
     #[test]
     fn plain_tex_is_not_detected_as_tar() {

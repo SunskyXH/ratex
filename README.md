@@ -59,10 +59,19 @@ protocol = "openai"
 endpoint = "https://openrouter.ai/api/v1"
 model = "anthropic/claude-sonnet-4-5"
 api_key_env = "OPENROUTER_API_KEY"
+
+[profiles.claude]
+protocol = "claude"
+# Optional: pin a model. Omit to let the Claude CLI pick.
+# model = "sonnet"
+# Optional: path to the binary. Defaults to "claude" on PATH.
+# endpoint = "/Users/me/.local/bin/claude"
 ```
 
-`protocol` is the wire format (`openai` or `gemini`); any OpenAI-compatible
-endpoint works under `protocol = "openai"`.
+`protocol` is the wire format. `openai` and `gemini` are HTTP APIs (any
+OpenAI-compatible endpoint works under `protocol = "openai"`). `claude`
+shells out to the local Claude Code CLI (`claude -p`) — no API key needed,
+auth comes from your existing `claude` install.
 
 Pick a profile per run with `--profile <name>`; CLI flags
 (`--model`, `--base-url`, `--api-key`, `--concurrency`) override profile
