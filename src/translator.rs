@@ -22,7 +22,8 @@ Critical rules:
 3. Maintain the EXACT same LaTeX structure and formatting.
 4. Use proper Chinese academic writing style (学术论文风格).
 5. For well-known technical terms, use the Chinese term followed by English in parentheses on first occurrence.
-6. Output ONLY the translated LaTeX content. No explanations, no markdown code fences, no extra text.";
+6. Output ONLY the translated LaTeX content — nothing else. Do NOT add a preface, summary, or sign-off, and never write meta phrases like 'Here is the output', 'I'll translate', 'I have translated', or describe what you did. The very first and last characters of your reply must be part of the LaTeX itself.
+7. If the input has no natural-language text to translate (e.g. only macro definitions, math, or comments), return it byte-for-byte UNCHANGED with no commentary.";
 
 /// LLM provider for translation.
 pub enum Provider {
@@ -72,6 +73,22 @@ fn build_http_client() -> reqwest::Client {
         .expect("failed to build HTTP client")
 }
 
+/// Clean a raw LLM translation response.
+///
+/// Translation runs per-chunk and each chunk is an independent LLM call, so
+/// the model can wrap *any* chunk in a fenced block or sandwich it between
+/// conversational lines ("Here is the output:", "I'll translate ...") even
+/// though the system prompt forbids it. Left in place, that prose lands in
+/// the `.tex` file and tectonic dies with "Missing \begin{document}".
+///
+/// Three passes cover the real-world shapes: a bare fenced block, a bare
+/// chatter preamble, and a chatter line sitting just above a fenced block.
+fn clean_response(text: &str) -> String {
+    let text = strip_llm_chatter(text);
+    let text = strip_code_fences(&text);
+    strip_llm_chatter(&text)
+}
+
 /// Strip markdown code fences if the LLM wrapped the response.
 fn strip_code_fences(text: &str) -> String {
     let trimmed = text.trim();
@@ -86,6 +103,101 @@ fn strip_code_fences(text: &str) -> String {
         return after_open[..close].trim_end().to_string();
     }
     after_open.to_string()
+}
+
+/// Drop conversational preamble/postamble paragraphs the model sometimes adds
+/// around the translation. Deliberately strict: a paragraph is removed only
+/// when it carries no LaTeX syntax at all AND opens like chatter, so genuine
+/// content (Chinese prose and/or LaTeX) is never touched. Strips from both
+/// ends but never empties the chunk.
+fn strip_llm_chatter(text: &str) -> String {
+    let spans = paragraph_spans(text);
+    if spans.is_empty() {
+        return text.trim().to_string();
+    }
+
+    let mut lo = 0;
+    while lo < spans.len() && looks_like_chatter(&text[spans[lo].0..spans[lo].1]) {
+        lo += 1;
+    }
+    let mut hi = spans.len();
+    while hi > lo && looks_like_chatter(&text[spans[hi - 1].0..spans[hi - 1].1]) {
+        hi -= 1;
+    }
+
+    // Everything looked like chatter — don't silently drop the whole chunk.
+    if lo >= hi {
+        return text.trim().to_string();
+    }
+    text[spans[lo].0..spans[hi - 1].1].trim().to_string()
+}
+
+/// Byte ranges of blank-line-delimited paragraphs (runs of non-blank lines).
+fn paragraph_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if line.trim().is_empty() {
+            if let Some(s) = start.take() {
+                spans.push((s, offset));
+            }
+        } else if start.is_none() {
+            start = Some(offset);
+        }
+        offset += line.len();
+    }
+    if let Some(s) = start {
+        spans.push((s, text.len()));
+    }
+    spans
+}
+
+/// True when a paragraph is the model talking about the translation rather
+/// than LaTeX content. Any `\`, `{`, `}`, `$`, or a leading `%` comment means
+/// it is content and is kept.
+fn looks_like_chatter(para: &str) -> bool {
+    let trimmed = para.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('\\')
+        || trimmed.contains('{')
+        || trimmed.contains('}')
+        || trimmed.contains('$')
+    {
+        return false;
+    }
+
+    let first = trimmed.lines().next().unwrap_or("").trim();
+    if first.starts_with('%') {
+        return false;
+    }
+
+    let opener = regex::Regex::new(
+        r"(?i)^(sure|certainly|of course|okay|ok|here'?s|here\s+(is|are)|i['’](ll|ve|m)|i\s+(will|have|am|translated|translate)|below\s+is|the\s+following|this\s+(is|content|file)|note:|以下是|翻译如下|译文如下|下面是)",
+    )
+    .expect("valid chatter regex")
+    .is_match(first);
+    if !opener {
+        return false;
+    }
+
+    // An opener alone is not enough — require a handoff colon or a word that
+    // ties the line to the act of translating, so an ordinary sentence that
+    // merely starts with "This is ..." survives.
+    let last = trimmed
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim_end();
+    let handoff = last.ends_with(':') || last.ends_with('：');
+    let lower = trimmed.to_lowercase();
+    let meta = lower.contains("translat")
+        || lower.contains("latex")
+        || lower.contains("preserv")
+        || lower.contains("unchanged")
+        || lower.contains("comment");
+    handoff || meta
 }
 
 // ─── OpenAI ──────────────────────────────────────────────────────────────────
@@ -175,7 +287,7 @@ impl OpenAiProvider {
             .map(|c| c.message.content)
             .unwrap_or_default();
 
-        Ok(strip_code_fences(&text))
+        Ok(clean_response(&text))
     }
 }
 
@@ -277,7 +389,7 @@ impl GeminiProvider {
             })
             .unwrap_or_default();
 
-        Ok(strip_code_fences(&text))
+        Ok(clean_response(&text))
     }
 }
 
@@ -344,7 +456,7 @@ impl ClaudeCliProvider {
 
         let text =
             String::from_utf8(output.stdout).context("Claude CLI returned non-UTF-8 output")?;
-        Ok(strip_code_fences(&text))
+        Ok(clean_response(&text))
     }
 }
 
@@ -429,5 +541,70 @@ mod tests {
     fn leaves_unrelated_text_alone() {
         let msg = "no secrets here";
         assert_eq!(redact_secrets(msg), msg);
+    }
+
+    // ─── response cleaning ────────────────────────────────────────────────
+
+    #[test]
+    fn strips_the_real_world_preamble() {
+        // The exact failure that broke 2503.20783: chatter prepended to a
+        // chunk of math_commands.tex (all macros) → tectonic "Missing
+        // \begin{document}".
+        let raw = "I'll translate the LaTeX content following your rules. This content is entirely LaTeX command definitions (macros) and comments — there is no natural language body text to translate except the comments. Per your rules, comments (lines starting with %) must be preserved exactly as-is.\n\nHere is the output:\n\n% Tensor\n\\def\\tA{{\\tens{A}}}\n";
+        let cleaned = clean_response(raw);
+        assert_eq!(cleaned, "% Tensor\n\\def\\tA{{\\tens{A}}}");
+    }
+
+    #[test]
+    fn leaves_clean_macro_chunk_untouched() {
+        let raw = "% Tensor\n\\def\\tA{{\\tens{A}}}\n\\def\\tB{{\\tens{B}}}";
+        assert_eq!(clean_response(raw), raw);
+    }
+
+    #[test]
+    fn keeps_chinese_body_prose() {
+        // Real translated content must survive even with no LaTeX syntax.
+        let raw = "我们提出了一种新的方法来解决这个问题。\n\n实验结果表明该方法是有效的。";
+        assert_eq!(clean_response(raw), raw);
+    }
+
+    #[test]
+    fn keeps_paragraph_that_mentions_translation_but_has_latex() {
+        // "translat" keyword present, but it's genuine content (has a command).
+        let raw = "我们翻译了 \\cite{smith2020} 中的定义。";
+        assert_eq!(clean_response(raw), raw);
+    }
+
+    #[test]
+    fn keeps_plain_sentence_starting_with_this_is() {
+        // Opener matches but there's no handoff colon or meta keyword.
+        let raw = "This is a normal sentence that should not be removed.";
+        assert_eq!(clean_response(raw), raw);
+    }
+
+    #[test]
+    fn strips_trailing_postamble() {
+        let raw = "\\section{方法}\n\n本节介绍方法。\n\nNote: I kept all LaTeX commands unchanged as requested.";
+        assert_eq!(clean_response(raw), "\\section{方法}\n\n本节介绍方法。");
+    }
+
+    #[test]
+    fn strips_chatter_line_above_a_fenced_block() {
+        let raw = "Here is the translated output:\n\n```latex\n\\section{引言}\n```";
+        assert_eq!(clean_response(raw), "\\section{引言}");
+    }
+
+    #[test]
+    fn plain_fenced_block_still_unwraps() {
+        let raw = "```latex\n\\section{引言}\n```";
+        assert_eq!(clean_response(raw), "\\section{引言}");
+    }
+
+    #[test]
+    fn never_empties_an_all_chatter_chunk() {
+        // Degenerate: nothing but chatter. Better to keep it than to silently
+        // drop the chunk and lose real content on a false positive.
+        let raw = "Here is the output:";
+        assert_eq!(clean_response(raw), "Here is the output:");
     }
 }
