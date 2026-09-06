@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use regex::Regex;
+use reqwest::Url;
 use std::io::{Cursor, Read};
 use std::path::Path;
 use tar::Archive;
-use url::Url;
 
 const URL_PATH_PREFIXES: &[&str] = &["abs", "pdf", "e-print", "html", "format"];
 
@@ -43,7 +43,7 @@ fn looks_like_url(input: &str) -> bool {
 }
 
 fn parse_url(input: &str) -> Result<String> {
-    // `url::Url` requires a scheme. Add a default one for bare-host inputs
+    // `Url` requires a scheme. Add a default one for bare-host inputs
     // like `arxiv.org/abs/...` so the parser can do its job.
     let normalized = if input.contains("://") {
         input.to_string()
@@ -160,42 +160,18 @@ pub async fn download_source(arxiv_id: &str, dest: &Path) -> Result<()> {
 }
 
 fn looks_like_tar(bytes: &[u8]) -> bool {
-    const BLOCK_SIZE: usize = 512;
-    const CHECKSUM_START: usize = 148;
-    const CHECKSUM_END: usize = 156;
-
-    if bytes.len() < BLOCK_SIZE {
-        return false;
-    }
-
-    let header = &bytes[..BLOCK_SIZE];
-    if header.iter().all(|&b| b == 0) {
-        return true;
-    }
-
-    let Some(stored_checksum) = parse_tar_checksum(&header[CHECKSUM_START..CHECKSUM_END]) else {
+    let Some(bytes) = bytes.get(..512) else {
         return false;
     };
-
-    // Checksum is computed as if the checksum field itself were ASCII spaces.
-    let computed_checksum: u32 = header[..CHECKSUM_START]
-        .iter()
-        .chain(&header[CHECKSUM_END..])
-        .chain(std::iter::repeat_n(&b' ', CHECKSUM_END - CHECKSUM_START))
-        .map(|&b| u32::from(b))
-        .sum();
-
-    stored_checksum == computed_checksum
-}
-
-fn parse_tar_checksum(field: &[u8]) -> Option<u32> {
-    let value = std::str::from_utf8(field).ok()?;
-    let value = value.trim_matches(|c: char| c.is_whitespace() || c == '\0');
-    if value.is_empty() {
-        return None;
+    if bytes.iter().all(|&b| b == 0) {
+        return true;
     }
-
-    u32::from_str_radix(value, 8).ok()
+    let mut header = tar::Header::from_byte_slice(bytes).clone();
+    let Ok(stored) = header.cksum() else {
+        return false;
+    };
+    header.set_cksum();
+    header.cksum().is_ok_and(|computed| stored == computed)
 }
 
 #[cfg(test)]
@@ -365,5 +341,23 @@ mod tests {
         let archive = builder.into_inner().unwrap();
 
         assert!(looks_like_tar(&archive));
+    }
+
+    #[test]
+    fn tar_header_checks_preserve_format_boundaries() {
+        assert!(!looks_like_tar(&[0; 511]));
+        assert!(looks_like_tar(&[0; 512]));
+        for mut header in [
+            tar::Header::new_old(),
+            tar::Header::new_ustar(),
+            tar::Header::new_gnu(),
+        ] {
+            header.set_path("main.tex").unwrap();
+            header.set_size(1);
+            header.set_cksum();
+            assert!(looks_like_tar(header.as_bytes()));
+            header.set_size(2);
+            assert!(!looks_like_tar(header.as_bytes()));
+        }
     }
 }

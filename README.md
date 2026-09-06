@@ -1,49 +1,108 @@
 # ratex
 
-Translate arXiv papers from English to Chinese, end to end. Downloads the
-source archive, sends each `.tex` chunk through an LLM, and recompiles
-the document to PDF with CJK support.
+Translate arXiv papers from English to Chinese. Downloads LaTeX source,
+translates it through an HTTP API or an authenticated local CLI, and compiles
+it to PDF. Source and completed translations are kept on disk.
 
 ## Install
 
-The repository is private, so install from a local clone:
+From a local clone:
 
 ```sh
 git clone git@github.com:SunskyXH/ratex.git
 cd ratex
-cargo install --path .
+cargo install --path . --locked
 ```
 
-This puts the `ratex` binary in `~/.cargo/bin/` (make sure that's on your
-`PATH`). To upgrade later, `git pull` and rerun `cargo install --path .`.
+This installs `ratex` in `~/.cargo/bin/`. To upgrade, pull and repeat the install.
 
-You also need a TeX engine on `PATH`. Either is fine:
+For PDF output, install either:
 
-- [tectonic](https://tectonic-typesetting.github.io/) (recommended; auto-downloads missing packages)
-- A full TeX Live / MacTeX install that provides `xelatex`
+- [Tectonic](https://tectonic-typesetting.github.io/) on `PATH`; or
+- TeX Live / MacTeX with `latexmk`, `xelatex`, `xeCJK`, and the Fandol fonts.
+
+Before translating, ratex compiles a small Chinese document to check the
+engine, packages, and fonts. If this fails, it continues with source output
+only. Choose a backend with `--compiler auto|tectonic|latexmk`.
 
 ## Usage
 
 ```sh
+ratex 2406.06608
 ratex https://arxiv.org/abs/2406.06608
-ratex 2406.06608                       # bare ID also works
-ratex 2406.06608 --no-compile          # skip PDF, just write translated .tex
-ratex 2406.06608 -o paper_zh.pdf       # custom output path
-ratex 2406.06608 --concurrency 8       # parallel translation requests
+ratex 2406.06608 --no-compile
+ratex 2406.06608 -o papers/paper_zh.pdf
+ratex 2406.06608 --source-dir another_translation
+ratex 2406.06608 --compiler latexmk
 ```
 
-The output PDF defaults to `<paper_id>_zh.pdf` in the current directory.
-If compilation fails, the translated `.tex` source tree is preserved at
-`<paper_id>_zh_tex/` so you can fix it manually without re-paying for
-translation.
+The default outputs are `2406.06608_zh.pdf` and the persistent source directory
+`2406.06608_zh_tex/`. An existing source directory is never overwritten; use
+`--source-dir` to choose a new one. With explicit `--no-compile`, `-o` selects
+the source directory instead of a PDF path.
+
+Recompile a finished translation without downloading or calling an LLM:
+
+```sh
+ratex --compile-only 2406.06608_zh_tex
+ratex --compile-only 2406.06608_zh_tex --compiler latexmk -o paper_zh.pdf
+```
+
+For `--compile-only`, the PDF defaults to a sibling of the source directory,
+with its trailing `_tex` replaced by `.pdf` (otherwise `.pdf` is appended).
+No model profile or API key is needed. Compilation runs relative to the source
+root, including when the main `.tex` lives in a subdirectory.
+
+## Failed runs
+
+Translation writes each completed chunk into a neighboring directory, for
+example `main.ratex-chunks/00001.tex`. The original `.tex` is replaced atomically
+only after all its chunks succeed; that file's chunk directory is then removed.
+Empty, refused, or truncated API responses fail instead of replacing source.
+
+A `.ratex-incomplete` marker remains until the whole translation completes.
+If a run fails, the source, completed files, and saved chunks remain available
+for manual recovery. Automatic translation resume is not implemented. Finish
+repairing the source and remove the marker before using `--compile-only`.
+
+Compilation has a five-minute timeout and keeps build logs with the source.
+A failed PDF export also leaves the compiled PDF available there. Tectonic runs
+in untrusted mode; the TeX Live backend uses `latexmk` without user/project rc
+files or shell escape. Package and template compatibility still depend on the
+chosen TeX distribution; complex papers may need the TeX Live backend.
 
 ## Configuration
 
-By default ratex reads `~/.config/ratex/config.toml`. Minimal example:
+Ratex reads `~/.config/ratex/config.toml`. For Codex users without an API key:
+
+```sh
+codex login
+```
 
 ```toml
-default_profile = "gemini"
-concurrency = 4
+default_profile = "codex"
+
+[profiles.codex]
+protocol = "codex"
+concurrency = 1
+# Optional model; omit to use the CLI's default.
+# model = "..."
+# Optional executable path; otherwise "codex" on PATH.
+# endpoint = "/Users/me/.local/bin/codex"
+```
+
+`codex` uses `codex exec` and your existing local login. ChatGPT account access
+and usage limits still apply. Each request uses an empty working directory,
+a read-only sandbox, stdin for input, and the final stdout reply for translation.
+
+Other profiles can coexist in the same file:
+
+```toml
+[profiles.claude]
+protocol = "claude"
+concurrency = 1
+# Optional: model = "sonnet"
+# Optional: endpoint = "/Users/me/.local/bin/claude"
 
 [profiles.gemini]
 protocol = "gemini"
@@ -59,32 +118,16 @@ protocol = "openai"
 endpoint = "https://openrouter.ai/api/v1"
 model = "anthropic/claude-sonnet-4-5"
 api_key_env = "OPENROUTER_API_KEY"
-
-[profiles.claude]
-protocol = "claude"
-# Optional: pin a model. Omit to let the Claude CLI pick.
-# model = "sonnet"
-# Optional: path to the binary. Defaults to "claude" on PATH.
-# endpoint = "/Users/me/.local/bin/claude"
 ```
 
-`protocol` is the wire format. `openai` and `gemini` are HTTP APIs (any
-OpenAI-compatible endpoint works under `protocol = "openai"`). `claude`
-shells out to the local Claude Code CLI (`claude -p`) — no API key needed,
-auth comes from your existing `claude` install.
+`openai` and `gemini` use HTTP APIs. `claude` invokes `claude -p` and reuses
+its local login, with no API key required by ratex.
 
-Pick a profile per run with `--profile <name>`; CLI flags
-(`--model`, `--base-url`, `--api-key`, `--concurrency`) override profile
-fields. The API key is read from the environment variable named by
-`api_key_env`; a `.env` file in the working directory is loaded
-automatically.
+Select a profile with `--profile <name>`. CLI flags `--model`, `--base-url`,
+`--api-key`, and `--concurrency` override its fields. For CLI profiles,
+`endpoint` / `--base-url` is the executable path. API keys come from the
+environment variable named by `api_key_env`; a working-directory `.env` is
+loaded automatically. Use `--config <path>` for a different configuration file.
 
-Pass `--config <path>` to use a config file at a non-default location.
-
-## Concurrency
-
-`concurrency` bounds how many translation requests are in flight at once,
-across both chunk-level and file-level parallelism. Default is `4`.
-Increase if your provider's rate limits allow it; decrease if you hit
-429s. A single shared semaphore caps total in-flight calls regardless
-of how the work is split.
+`concurrency` limits total in-flight translation calls across files and chunks.
+The default is 4; use a lower value for authenticated CLIs or provider limits.
