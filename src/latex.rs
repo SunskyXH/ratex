@@ -1,11 +1,100 @@
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use regex::Regex;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::translator::Provider;
+
+/// Hide comments without changing byte offsets used to edit the original text.
+fn uncommented(content: &str) -> String {
+    let mut bytes = content.as_bytes().to_vec();
+    let mut comment = false;
+    let mut escaped = false;
+    for byte in &mut bytes {
+        if *byte == b'\n' {
+            comment = false;
+        } else if comment || (*byte == b'%' && !escaped) {
+            comment = true;
+            *byte = b' ';
+        }
+        escaped = *byte == b'\\' && !escaped;
+    }
+    String::from_utf8(bytes).expect("comment masking preserves UTF-8")
+}
+
+fn group_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut closing = vec![if bytes[start] == b'[' { b']' } else { b'}' }];
+    let mut escaped = false;
+    for (i, &byte) in bytes.iter().enumerate().skip(start + 1) {
+        if !escaped {
+            if byte == b'{' {
+                closing.push(b'}');
+            } else if closing.last() == Some(&byte) {
+                closing.pop();
+                if closing.is_empty() {
+                    return Some(i + 1);
+                }
+            }
+        }
+        escaped = byte == b'\\' && !escaped;
+    }
+    None
+}
+
+/// Find literal commands with an optional [...] and a complete {...} argument.
+/// Class/package commands also include their optional trailing release date.
+// ponytail: literal TeX commands only; expand macros only if real papers require it.
+fn commands(content: &str, command: &str) -> Vec<(Range<usize>, Range<usize>)> {
+    let bytes = content.as_bytes();
+    let mut matches = Vec::new();
+    for (start, _) in content.match_indices(command) {
+        if bytes[..start]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'\\')
+            .count()
+            % 2
+            != 0
+        {
+            continue;
+        }
+        let mut pos = start + command.len();
+        while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+        if bytes.get(pos) == Some(&b'[') {
+            let Some(end) = group_end(bytes, pos) else {
+                continue;
+            };
+            pos = end;
+            while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+                pos += 1;
+            }
+        }
+        if bytes.get(pos) == Some(&b'{')
+            && let Some(end) = group_end(bytes, pos)
+        {
+            let mut command_end = end;
+            if matches!(command, "\\documentclass" | "\\usepackage") {
+                let mut tail = end;
+                while bytes.get(tail).is_some_and(u8::is_ascii_whitespace) {
+                    tail += 1;
+                }
+                if bytes.get(tail) == Some(&b'[') {
+                    let Some(end) = group_end(bytes, tail) else {
+                        continue;
+                    };
+                    command_end = end;
+                }
+            }
+            matches.push((start..command_end, pos + 1..end - 1));
+        }
+    }
+    matches
+}
 
 /// Recursively find all .tex files in `dir`.
 pub fn find_tex_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -24,6 +113,11 @@ fn collect_tex_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".ratex-build-") || name.ends_with(".ratex-chunks") {
+                continue;
+            }
             collect_tex_files(&path, files)?;
         } else if path.extension().is_some_and(|e| e == "tex") {
             files.push(path);
@@ -32,38 +126,34 @@ fn collect_tex_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Replace `\bibliography{X}` in `main_tex` with `\input{X.bbl}` when no
-/// `X.bib` is available next to it but a pre-generated `.bbl` exists.
+/// Replace `\bibliography{X}` with an existing `.bbl` when its `.bib` is absent.
+/// TeX input paths are relative to `source_root`, including nested main files.
 ///
 /// arXiv source archives commonly ship `main.bbl` without the underlying
 /// `.bib`. Tectonic auto-runs bibtex on every compile, which silently
 /// fails on the missing `.bib` and overwrites the pre-generated `.bbl`
 /// with an empty stub — leaving every `\cite` rendering as `?`.
-/// Inlining the existing `.bbl` keeps `\bibdata{}` out of the `.aux`,
-/// so tectonic never tries to run bibtex in the first place.
-pub fn inline_missing_bibliography(main_tex: &Path) -> Result<bool> {
-    let dir = main_tex
-        .parent()
-        .ok_or_else(|| anyhow!("main tex has no parent directory"))?;
+/// Inputting a `.tex` copy keeps `\bibdata{}` out of the `.aux` and prevents
+/// latexmk from treating the bibliography input as a generated `.bbl`.
+pub fn inline_missing_bibliography(main_tex: &Path, source_root: &Path) -> Result<bool> {
     let content = std::fs::read_to_string(main_tex)
         .with_context(|| format!("Failed to read {}", main_tex.display()))?;
 
-    let bib_re =
-        Regex::new(r"(?m)^([ \t]*)\\bibliography\{([^}]+)\}[ \t]*$").expect("invalid regex");
-
+    let active = uncommented(&content);
     let mut new_content = content.clone();
     let mut rewrote_any = false;
-    for cap in bib_re.captures_iter(&content) {
-        let full = cap.get(0).expect("regex match").as_str().to_string();
-        let names: Vec<String> = cap[2]
+    for (range, args) in commands(&active, "\\bibliography").into_iter().rev() {
+        let names: Vec<&str> = active[args]
             .split(',')
-            .map(|s| s.trim().to_string())
+            .map(str::trim)
             .filter(|s| !s.is_empty())
             .collect();
 
         // Don't touch this call if every referenced .bib is present —
         // bibtex will work normally and we shouldn't second-guess it.
-        let any_bib_missing = names.iter().any(|n| !dir.join(format!("{n}.bib")).exists());
+        let any_bib_missing = names
+            .iter()
+            .any(|n| !source_root.join(format!("{n}.bib")).exists());
         if !any_bib_missing {
             continue;
         }
@@ -73,32 +163,42 @@ pub fn inline_missing_bibliography(main_tex: &Path) -> Result<bool> {
         // as the main tex (arXiv's typical layout).
         let bbl = names
             .iter()
-            .map(|n| dir.join(format!("{n}.bbl")))
+            .map(|n| source_root.join(format!("{n}.bbl")))
             .find(|p| p.exists())
             .or_else(|| {
                 main_tex
                     .file_stem()
-                    .map(|stem| dir.join(format!("{}.bbl", stem.to_string_lossy())))
+                    .map(|stem| source_root.join(format!("{}.bbl", stem.to_string_lossy())))
                     .filter(|p| p.exists())
-            });
+            })
+            .or_else(|| Some(main_tex.with_extension("bbl")).filter(|p| p.exists()));
 
         let Some(bbl_path) = bbl else { continue };
+        let temp = tempfile::Builder::new()
+            .prefix(".ratex-bbl-")
+            .suffix(".tex")
+            .tempfile_in(source_root)?;
+        std::fs::copy(&bbl_path, temp.path())
+            .with_context(|| format!("Failed to copy {}", bbl_path.display()))?;
+        let (_, bbl_path) = temp
+            .keep()
+            .context("Failed to preserve bibliography input")?;
         let bbl_filename = bbl_path
-            .file_name()
-            .expect("bbl path has filename")
+            .strip_prefix(source_root)
+            .context("bibliography is outside the source directory")?
             .to_string_lossy();
 
-        let replacement = format!(
-            "% [ratex] no .bib found beside the source — inline pre-generated .bbl\n\
-             \\input{{{bbl_filename}}}"
-        );
-        new_content = new_content.replace(&full, &replacement);
+        let replacement = format!("\\input{{{bbl_filename}}}");
+        new_content.replace_range(range, &replacement);
         rewrote_any = true;
     }
 
     if rewrote_any {
-        std::fs::write(main_tex, &new_content)
+        let temp = tempfile::NamedTempFile::new_in(source_root)?;
+        std::fs::write(temp.path(), &new_content)
             .with_context(|| format!("Failed to write {}", main_tex.display()))?;
+        temp.persist(main_tex)
+            .with_context(|| format!("Failed to replace {}", main_tex.display()))?;
     }
     Ok(rewrote_any)
 }
@@ -106,14 +206,10 @@ pub fn inline_missing_bibliography(main_tex: &Path) -> Result<bool> {
 /// Find the main .tex file (the one containing \documentclass).
 pub fn find_main_tex(tex_files: &[PathBuf]) -> Result<PathBuf> {
     for file in tex_files {
-        if let Ok(content) = std::fs::read_to_string(file) {
-            // Check for \documentclass not inside a comment
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if !trimmed.starts_with('%') && trimmed.contains("\\documentclass") {
-                    return Ok(file.clone());
-                }
-            }
+        if let Ok(content) = std::fs::read_to_string(file)
+            && !commands(&uncommented(&content), "\\documentclass").is_empty()
+        {
+            return Ok(file.clone());
         }
     }
     bail!("Could not identify the main .tex file — none contain \\documentclass.");
@@ -124,60 +220,56 @@ pub fn find_main_tex(tex_files: &[PathBuf]) -> Result<PathBuf> {
 /// pdfTeX-only directives that confuse hyperref's driver auto-detection
 /// when the file is compiled with `XeTeX` (Tectonic / xelatex).
 pub fn add_cjk_support(content: &str) -> String {
-    let mut lines: Vec<String> = content.lines().map(ToString::to_string).collect();
-    let mut insert_pos = None;
-    let mut removals = Vec::new();
+    let active = uncommented(content);
+    let preamble_end = commands(&active, "\\begin")
+        .into_iter()
+        .find(|(_, args)| active[args.clone()].trim() == "document")
+        .map_or(content.len(), |(range, _)| range.start);
+    let preamble = &active[..preamble_end];
+    let mut edits = Vec::new();
 
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
+    if let Some((class, _)) = commands(preamble, "\\documentclass").first() {
+        edits.push((
+            class.end..class.end,
+            concat!(
+                "\n% [ratex] CJK support for Chinese translation\n",
+                "\\usepackage{xeCJK}\n",
+                "\\setCJKmainfont{FandolSong-Regular.otf}\n",
+                "\\setCJKsansfont{FandolHei-Regular.otf}\n",
+                "\\setCJKmonofont{FandolFang-Regular.otf}\n",
+            )
+            .to_string(),
+        ));
+    }
 
-        // Find \documentclass line to know where to insert after
-        if !trimmed.starts_with('%') && trimmed.contains("\\documentclass") && insert_pos.is_none()
-        {
-            insert_pos = Some(i + 1);
-        }
-
-        // Mark fontenc and inputenc for removal (they conflict with xelatex)
-        if !trimmed.starts_with('%')
-            && trimmed.contains("\\usepackage")
-            && (trimmed.contains("fontenc") || trimmed.contains("inputenc"))
-        {
-            removals.push(i);
-        }
-
-        // \pdfoutput=1 (arXiv's pdfTeX hint) misleads hyperref into loading
-        // hpdftex.def under XeTeX, which then fails on pdfTeX-only primitives.
-        if !trimmed.starts_with('%') && trimmed.starts_with("\\pdfoutput") {
-            removals.push(i);
-        }
-
-        // Stop at \begin{document}
-        if trimmed.starts_with("\\begin{document}") {
-            break;
+    for (range, args) in commands(preamble, "\\usepackage") {
+        let packages: Vec<_> = preamble[args.clone()].split(',').map(str::trim).collect();
+        let kept: Vec<_> = packages
+            .iter()
+            .copied()
+            .filter(|name| !matches!(*name, "fontenc" | "inputenc"))
+            .collect();
+        if kept.len() != packages.len() {
+            edits.push(if kept.is_empty() {
+                (range, String::new())
+            } else {
+                (args, kept.join(","))
+            });
         }
     }
 
-    // Remove conflicting packages (reverse order to preserve indices)
-    for &idx in removals.iter().rev() {
-        lines[idx] = format!("% [ratex] removed: {}", lines[idx]);
+    static PDFOUTPUT: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\\pdfoutput\s*=?\s*[0-9]+").expect("valid pdfoutput regex"));
+    for directive in PDFOUTPUT.find_iter(preamble) {
+        edits.push((directive.range(), String::new()));
     }
 
-    // Insert CJK support after \documentclass
-    if let Some(pos) = insert_pos {
-        let cjk_lines = vec![
-            String::new(),
-            "% [ratex] CJK support for Chinese translation".to_string(),
-            "\\usepackage{xeCJK}".to_string(),
-            "\\setCJKmainfont{FandolSong-Regular.otf}".to_string(),
-            "\\setCJKsansfont{FandolHei-Regular.otf}".to_string(),
-            "\\setCJKmonofont{FandolFang-Regular.otf}".to_string(),
-        ];
-        for (j, line) in cjk_lines.into_iter().enumerate() {
-            lines.insert(pos + j, line);
-        }
+    edits.sort_by_key(|(range, _)| range.start);
+    let mut result = content.to_string();
+    for (range, replacement) in edits.into_iter().rev() {
+        result.replace_range(range, &replacement);
     }
-
-    lines.join("\n")
+    result
 }
 
 /// Split content into translatable chunks at section/paragraph boundaries.
@@ -188,27 +280,23 @@ fn split_into_chunks(body: &str, max_bytes: usize) -> Vec<String> {
         return vec![body.to_string()];
     }
 
-    let section_re = Regex::new(r"(?m)^(\\(?:section|subsection|subsubsection|chapter|part)\*?\{)")
-        .expect("invalid regex");
+    static SECTION: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^(\\(?:section|subsection|subsubsection|chapter|part)\*?\{)")
+            .expect("invalid regex")
+    });
 
     // Split at section boundaries first
     let mut sections = Vec::new();
     let mut last_end = 0;
 
-    for m in section_re.find_iter(body) {
+    for m in SECTION.find_iter(body) {
         if m.start() > last_end {
-            let piece = &body[last_end..m.start()];
-            if !piece.trim().is_empty() {
-                sections.push(piece.to_string());
-            }
+            sections.push(body[last_end..m.start()].to_string());
         }
         last_end = m.start();
     }
     if last_end < body.len() {
-        let piece = &body[last_end..];
-        if !piece.trim().is_empty() {
-            sections.push(piece.to_string());
-        }
+        sections.push(body[last_end..].to_string());
     }
 
     // Now split oversized sections at paragraph boundaries
@@ -221,12 +309,11 @@ fn split_into_chunks(body: &str, max_bytes: usize) -> Vec<String> {
 
         // Split at paragraph boundaries (double newlines)
         let mut current = String::new();
-        for paragraph in section.split("\n\n") {
-            if current.len() + paragraph.len() + 2 > max_bytes && !current.is_empty() {
+        // Keep each original delimiter so concatenating responses preserves TeX whitespace.
+        // ponytail: keep oversized paragraphs intact; add TeX-aware splitting if needed.
+        for paragraph in section.split_inclusive("\n\n") {
+            if current.len() + paragraph.len() > max_bytes && !current.is_empty() {
                 chunks.push(std::mem::take(&mut current));
-            }
-            if !current.is_empty() {
-                current.push_str("\n\n");
             }
             current.push_str(paragraph);
         }
@@ -242,8 +329,7 @@ fn split_into_chunks(body: &str, max_bytes: usize) -> Vec<String> {
 ///
 /// Each file becomes its own task, all sharing the chunk-level
 /// `Arc<Semaphore>` so total in-flight API calls stay bounded by the
-/// configured concurrency. Empty / unreadable files are skipped with a
-/// warning. On the first task error every other task is aborted and
+/// configured concurrency. Empty files are skipped. On the first task error every other task is aborted and
 /// the error is propagated (fail-fast, same as chunk-level).
 pub async fn translate_all(
     tex_files: Vec<PathBuf>,
@@ -266,13 +352,9 @@ pub async fn translate_all(
                 .to_string_lossy()
                 .into_owned();
 
-            let content = match tokio::fs::read_to_string(&tex_file).await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("  Skipping {filename} (cannot read: {e})");
-                    return Ok(None);
-                }
-            };
+            let content = tokio::fs::read_to_string(&tex_file)
+                .await
+                .with_context(|| format!("Failed to read {}", tex_file.display()))?;
             if content.trim().is_empty() {
                 return Ok(None);
             }
@@ -282,33 +364,36 @@ pub async fn translate_all(
             } else {
                 filename.clone()
             };
-            let translated =
-                translate_tex_file(&content, is_main, &provider, &semaphore, &label).await?;
-            tokio::fs::write(&tex_file, translated)
+            let progress_dir = tex_file.with_extension("ratex-chunks");
+            tokio::fs::create_dir(&progress_dir)
                 .await
-                .with_context(|| format!("Failed to write translated {filename}"))?;
+                .with_context(|| format!("Failed to create {}", progress_dir.display()))?;
+            let translated = translate_tex_file(
+                &content,
+                is_main,
+                &provider,
+                &semaphore,
+                &label,
+                &progress_dir,
+            )
+            .await?;
+            write_atomic(&tex_file, &translated).await?;
+            if let Err(e) = tokio::fs::remove_dir_all(&progress_dir).await {
+                eprintln!(
+                    "  Warning: could not remove {}: {e}",
+                    progress_dir.display()
+                );
+            }
             Ok(Some(filename))
         });
     }
 
     let mut completed = 0usize;
     while let Some(joined) = set.join_next().await {
-        match joined {
-            Ok(Ok(Some(filename))) => {
-                completed += 1;
-                eprintln!("  [{completed}/{total}] {filename}");
-            }
-            Ok(Ok(None)) => {
-                completed += 1;
-            }
-            Ok(Err(e)) => {
-                set.abort_all();
-                return Err(e);
-            }
-            Err(e) => {
-                set.abort_all();
-                return Err(anyhow!("file translation task panicked: {e}"));
-            }
+        let filename = joined.context("file translation task failed")??;
+        completed += 1;
+        if let Some(filename) = filename {
+            eprintln!("  [{completed}/{total}] {filename}");
         }
     }
     Ok(())
@@ -324,40 +409,62 @@ pub async fn translate_tex_file(
     provider: &Arc<Provider>,
     semaphore: &Arc<Semaphore>,
     label: &str,
+    progress_dir: &Path,
 ) -> Result<String> {
-    // Find \begin{document} and \end{document}
-    let doc_begin = content.find("\\begin{document}");
-    let doc_end = content.rfind("\\end{document}");
+    let active = uncommented(content);
+    let doc_begin = commands(&active, "\\begin")
+        .into_iter()
+        .find(|(_, args)| active[args.clone()].trim() == "document")
+        .map(|(range, _)| range);
 
-    if is_main && let Some(begin_pos) = doc_begin {
-        let preamble = &content[..begin_pos];
-        let after_begin = &content[begin_pos..];
+    if is_main && let Some(begin) = doc_begin {
+        let preamble = &content[..begin.start];
 
         // Add CJK support to preamble
         let new_preamble = add_cjk_support(preamble);
 
         // Extract the body between \begin{document} and \end{document}
-        let body_start = "\\begin{document}".len();
-        let body_content = if let Some(end_pos) = after_begin.rfind("\\end{document}") {
-            &after_begin[body_start..end_pos]
-        } else {
-            &after_begin[body_start..]
-        };
+        let doc_end = commands(&active, "\\end")
+            .into_iter()
+            .rev()
+            .find(|(range, args)| {
+                range.start >= begin.end && active[args.clone()].trim() == "document"
+            })
+            .map(|(range, _)| range.start);
+        let body_content = &content[begin.end..doc_end.unwrap_or(content.len())];
 
         // Translate body in chunks
-        let translated_body = translate_chunks(body_content, provider, semaphore, label).await?;
+        let translated_body =
+            translate_chunks(body_content, provider, semaphore, label, progress_dir).await?;
 
         let mut result = new_preamble;
-        result.push_str("\\begin{document}");
+        if !result.ends_with('\n') {
+            result.push('\n');
+        }
+        result.push_str(&content[begin]);
         result.push_str(&translated_body);
-        if doc_end.is_some() {
-            result.push_str("\\end{document}\n");
+        if let Some(end) = doc_end {
+            if !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str(&content[end..]);
         }
         return Ok(result);
     }
 
     // For non-main files or files without \begin{document}, translate everything
-    translate_chunks(content, provider, semaphore, label).await
+    translate_chunks(content, provider, semaphore, label, progress_dir).await
+}
+
+async fn write_atomic(path: &Path, content: &str) -> Result<()> {
+    let temp = tempfile::NamedTempFile::new_in(path.parent().context("output has no parent")?)
+        .with_context(|| format!("Failed to create temporary file for {}", path.display()))?;
+    tokio::fs::write(temp.path(), content)
+        .await
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    temp.persist(path)
+        .with_context(|| format!("Failed to replace {}", path.display()))?;
+    Ok(())
 }
 
 async fn translate_chunks(
@@ -365,6 +472,7 @@ async fn translate_chunks(
     provider: &Arc<Provider>,
     semaphore: &Arc<Semaphore>,
     label: &str,
+    progress_dir: &Path,
 ) -> Result<String> {
     let chunks = split_into_chunks(content, 8000);
     let total = chunks.len();
@@ -377,6 +485,7 @@ async fn translate_chunks(
     for (i, chunk) in chunks.into_iter().enumerate() {
         let provider = Arc::clone(provider);
         let semaphore = Arc::clone(semaphore);
+        let chunk_path = progress_dir.join(format!("{:05}.tex", i + 1));
         set.spawn(async move {
             // Acquire happens inside the task so all chunks are queued without
             // serializing the spawning loop on permit availability.
@@ -388,6 +497,7 @@ async fn translate_chunks(
                 .translate(&chunk)
                 .await
                 .with_context(|| format!("Failed to translate chunk {}/{}", i + 1, total))?;
+            write_atomic(&chunk_path, &result).await?;
             Ok((i, result))
         });
     }
@@ -395,30 +505,19 @@ async fn translate_chunks(
     let mut results: Vec<Option<String>> = (0..total).map(|_| None).collect();
     let mut completed = 0usize;
     while let Some(joined) = set.join_next().await {
-        match joined {
-            Ok(Ok((i, text))) => {
-                completed += 1;
-                if total > 1 {
-                    eprintln!("  {label}: chunk {completed}/{total} done");
-                }
-                results[i] = Some(text);
-            }
-            Ok(Err(e)) => {
-                set.abort_all();
-                return Err(e);
-            }
-            Err(e) => {
-                set.abort_all();
-                return Err(anyhow!("translation task panicked: {e}"));
-            }
+        let (i, text) = joined.context("translation task failed")??;
+        completed += 1;
+        if total > 1 {
+            eprintln!("  {label}: chunk {completed}/{total} done");
         }
+        results[i] = Some(text);
     }
 
     Ok(results
         .into_iter()
         .map(|o| o.expect("chunk index missing — JoinSet returned fewer results than spawned"))
         .collect::<Vec<_>>()
-        .join("\n\n"))
+        .concat())
 }
 
 #[cfg(test)]
@@ -429,16 +528,11 @@ mod tests {
     fn add_cjk_support_neutralizes_pdfoutput() {
         let src = "\\pdfoutput=1\n\\documentclass{article}\n\\usepackage{hyperref}\n\\begin{document}\nhi\n\\end{document}\n";
         let out = add_cjk_support(src);
-        // Original line is no longer an active directive — it has been
-        // commented out so XeTeX doesn't see \pdfoutput=1.
+        // XeTeX must not see the pdfTeX-only assignment.
         assert!(
             !out.lines()
                 .any(|l| l.trim_start().starts_with("\\pdfoutput")),
             "uncommented \\pdfoutput remained:\n{out}"
-        );
-        assert!(
-            out.contains("[ratex] removed:"),
-            "expected removal marker, got:\n{out}"
         );
         assert!(
             out.contains("\\usepackage{xeCJK}"),
@@ -466,6 +560,138 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cjk_edits_preserve_comments_packages_and_multiline_class() {
+        let src = concat!(
+            "% \\documentclass{ignored}\n",
+            "\\documentclass[\n11pt,foo={]} % closing ] inside braces/comment\n]{article}% class note\n",
+            "\\usepackage[T1]{fontenc} \\usepackage{amsmath}% keep this\n",
+            "\\usepackage{inputenc,graphicx}\n",
+            "\\usepackage{hyperref} % fontenc is mentioned only in a comment\n",
+            "% end preamble\n",
+        );
+        let out = add_cjk_support(src);
+        assert!(out.starts_with("% \\documentclass{ignored}\n\\documentclass["));
+        assert!(out.find("]{article}").unwrap() < out.find("\\usepackage{xeCJK}").unwrap());
+        assert!(out.contains(" \\usepackage{amsmath}% keep this\n"));
+        assert!(out.contains("\\usepackage{graphicx}\n"));
+        assert!(out.contains("\\usepackage{hyperref} % fontenc is mentioned only in a comment\n"));
+        assert!(out.ends_with("% end preamble\n"));
+        assert_eq!(
+            uncommented("\\% kept % 隐藏\n\\\\% hidden\n"),
+            "\\% kept         \n\\\\        \n"
+        );
+    }
+
+    #[test]
+    fn cjk_edits_preserve_trailing_release_dates() {
+        let class = "\\documentclass{article}% class date\n \t[2020/01/01]";
+        let src = format!(
+            "{class}% class note\n{}",
+            concat!(
+                "\\usepackage[T1]{fontenc}% package date\n[2017/01/01]% keep this\n",
+                "\\usepackage[utf8]{inputenc} \t[2018/01/01]\n",
+                "\\usepackage{inputenc,graphicx} % keep package date\n[2019/01/01]\n",
+                "\\begin{document}\\texttt{Hello}\\end{document}\n",
+            )
+        );
+        let out = add_cjk_support(&src);
+        assert!(out.starts_with(&format!("{class}\n% [ratex]")), "{out}");
+        assert!(!out.contains("fontenc"), "{out}");
+        assert!(!out.contains("inputenc"), "{out}");
+        assert!(!out.contains("[2017/01/01]"), "{out}");
+        assert!(!out.contains("[2018/01/01]"), "{out}");
+        assert!(out.contains("% keep this\n"), "{out}");
+        assert!(
+            out.contains("\\usepackage{graphicx} % keep package date\n[2019/01/01]"),
+            "{out}"
+        );
+        for command in ["\\begin", "\\end"] {
+            let text = format!("{command}{{document}}[English text]");
+            let (range, _) = &commands(&text, command)[0];
+            assert_eq!(&text[range.end..], "[English text]");
+        }
+    }
+
+    #[test]
+    fn chunking_retains_original_separators() {
+        let src = "\n\n\\section{One}\nText.% comment\n\n\n\\section{Two}\nMore text.\n\n";
+        assert_eq!(split_into_chunks(src, 24).concat(), src);
+        assert_eq!(split_into_chunks("\n\n\n\n", 1).concat(), "\n\n\n\n");
+    }
+
+    #[cfg(unix)]
+    fn mock_cli(dir: &Path) -> Arc<Provider> {
+        use crate::config::{Protocol, ResolvedProfile};
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("mock-claude");
+        std::fs::write(&bin, "#!/bin/sh\ninput=$(/bin/cat)\ncase \"$input\" in *FAIL*) exit 1;; esac\nprintf '%s' \"$input\"\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Arc::new(Provider::new(&ResolvedProfile {
+            protocol: Protocol::Claude,
+            endpoint: bin.to_string_lossy().into_owned(),
+            model: String::new(),
+            api_key: String::new(),
+            concurrency: 1,
+        }))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn translated_document_boundaries_survive_comments() {
+        let dir = make_tempdir();
+        let original = concat!(
+            "\\documentclass[\n11pt\n]{article}\n",
+            "% fake \\begin{document}\n% end preamble\n",
+            "\\begin{document}\nHello\n",
+            "\\begin{verbatim}\n\\end{document}\n\\end{verbatim}\nAfter code sample.\n% end body\n",
+            "\\end{document}\n% keep trailing comments\n",
+        );
+        let out = translate_tex_file(
+            original,
+            true,
+            &mock_cli(dir.path()),
+            &Arc::new(Semaphore::new(1)),
+            "main",
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("% end preamble\n\\begin{document}\n"));
+        assert!(out.contains("% end body\n\\end{document}\n% keep trailing comments\n"));
+        assert!(
+            std::fs::read_to_string(dir.path().join("00001.tex"))
+                .unwrap()
+                .contains("After code sample.")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_translation_keeps_original_and_completed_chunks() {
+        let dir = make_tempdir();
+        let main = dir.path().join("main.tex");
+        let first = format!("{}\n\n", "A".repeat(7997));
+        let original = format!(
+            "\\documentclass{{article}}\n\\begin{{document}}{first}FAIL\\end{{document}}\n"
+        );
+        std::fs::write(&main, &original).unwrap();
+        let error = translate_all(
+            vec![main.clone()],
+            &main,
+            mock_cli(dir.path()),
+            Arc::new(Semaphore::new(1)),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("chunk 2/2"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(main.with_extension("ratex-chunks").join("00001.tex")).unwrap(),
+            first
+        );
+    }
+
     fn make_tempdir() -> tempfile::TempDir {
         tempfile::tempdir().expect("create tempdir")
     }
@@ -475,17 +701,38 @@ mod tests {
         let dir = make_tempdir();
         let main = dir.path().join("main.tex");
         std::fs::write(&main, "before\n\\bibliography{custom}\nafter\n").unwrap();
-        std::fs::write(dir.path().join("main.bbl"), "% bbl content").unwrap();
+        let bibliography = "% bbl content\n\\endinput\n";
+        std::fs::write(dir.path().join("main.bbl"), bibliography).unwrap();
         // No custom.bib, no custom.bbl — fall back to <main_stem>.bbl.
 
-        let changed = inline_missing_bibliography(&main).unwrap();
+        let changed = inline_missing_bibliography(&main, dir.path()).unwrap();
         assert!(changed);
         let out = std::fs::read_to_string(&main).unwrap();
-        assert!(out.contains("\\input{main.bbl}"), "got:\n{out}");
+        let copy = dir
+            .path()
+            .join(&out[commands(&out, "\\input")[0].1.clone()]);
+        assert_eq!(copy.extension().unwrap(), "tex");
+        assert!(
+            copy.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(".ratex-bbl-")
+        );
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), bibliography);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.bbl")).unwrap(),
+            bibliography
+        );
         assert!(
             !out.contains("\\bibliography{custom}"),
             "still has original call:\n{out}"
         );
+        let files = std::fs::read_dir(dir.path()).unwrap().count();
+        assert!(!inline_missing_bibliography(&main, dir.path()).unwrap());
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), out);
+        assert_eq!(std::fs::read_to_string(copy).unwrap(), bibliography);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), files);
     }
 
     #[test]
@@ -496,11 +743,15 @@ mod tests {
         std::fs::write(dir.path().join("refs.bbl"), "named bbl").unwrap();
         std::fs::write(dir.path().join("main.bbl"), "stem bbl").unwrap();
 
-        inline_missing_bibliography(&main).unwrap();
+        inline_missing_bibliography(&main, dir.path()).unwrap();
         let out = std::fs::read_to_string(&main).unwrap();
-        assert!(
-            out.contains("\\input{refs.bbl}"),
-            "expected refs.bbl, got:\n{out}"
+        let copy = dir
+            .path()
+            .join(&out[commands(&out, "\\input")[0].1.clone()]);
+        assert_eq!(std::fs::read_to_string(copy).unwrap(), "named bbl");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("refs.bbl")).unwrap(),
+            "named bbl"
         );
     }
 
@@ -513,7 +764,7 @@ mod tests {
         std::fs::write(dir.path().join("custom.bib"), "@article{...}").unwrap();
         std::fs::write(dir.path().join("custom.bbl"), "stale").unwrap();
 
-        let changed = inline_missing_bibliography(&main).unwrap();
+        let changed = inline_missing_bibliography(&main, dir.path()).unwrap();
         assert!(!changed, "should not rewrite when .bib is present");
         assert_eq!(std::fs::read_to_string(&main).unwrap(), original);
     }
@@ -526,8 +777,34 @@ mod tests {
         std::fs::write(&main, original).unwrap();
         // No .bib, no .bbl anywhere — leave the file alone.
 
-        let changed = inline_missing_bibliography(&main).unwrap();
+        let changed = inline_missing_bibliography(&main, dir.path()).unwrap();
         assert!(!changed);
         assert_eq!(std::fs::read_to_string(&main).unwrap(), original);
+    }
+
+    #[test]
+    fn inline_bbl_keeps_paths_relative_to_source_root() {
+        let dir = make_tempdir();
+        std::fs::create_dir(dir.path().join("paper")).unwrap();
+        std::fs::create_dir(dir.path().join("refs")).unwrap();
+        let main = dir.path().join("paper/main.tex");
+        std::fs::write(
+            &main,
+            "% \\bibliography{ignored}\n\\bibliography{refs/custom}% trailing comment\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("refs/custom.bbl"), "existing bibliography").unwrap();
+        assert!(inline_missing_bibliography(&main, dir.path()).unwrap());
+        let out = std::fs::read_to_string(&main).unwrap();
+        let input = &out[commands(&out, "\\input")[0].1.clone()];
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(input)).unwrap(),
+            "existing bibliography"
+        );
+        assert!(!main.parent().unwrap().join(input).exists());
+        assert_eq!(
+            out,
+            format!("% \\bibliography{{ignored}}\n\\input{{{input}}}% trailing comment\n")
+        );
     }
 }

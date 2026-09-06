@@ -3,10 +3,10 @@ mod compiler;
 mod config;
 mod latex;
 mod translator;
-mod utils;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -21,7 +21,23 @@ use config::ResolveInputs;
 )]
 struct Cli {
     /// arXiv paper URL or ID (e.g., <https://arxiv.org/abs/2301.00001> or 2301.00001)
-    url: String,
+    #[arg(
+        required_unless_present = "compile_only",
+        conflicts_with = "compile_only"
+    )]
+    url: Option<String>,
+
+    /// Compile an existing translated source directory, without calling an LLM
+    #[arg(long, conflicts_with = "no_compile")]
+    compile_only: Option<PathBuf>,
+
+    /// Directory to keep source and completed translations (default: {paper_id}_zh_tex)
+    #[arg(long, conflicts_with = "compile_only")]
+    source_dir: Option<PathBuf>,
+
+    /// TeX backend to use
+    #[arg(long, value_enum, default_value = "auto")]
+    compiler: compiler::Compiler,
 
     /// Path to config file (default: ~/.config/ratex/config.toml)
     #[arg(long)]
@@ -62,10 +78,45 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
 
     let cli = Cli::parse();
-    run(cli).await
+    tokio::select! {
+        result = run(cli) => result,
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("Failed to listen for Ctrl+C")?;
+            bail!("Interrupted; source and completed work remain on disk")
+        }
+    }
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    if let Some(source_dir) = &cli.compile_only {
+        let source_dir = source_dir
+            .canonicalize()
+            .context("Cannot open source directory")?;
+        if std::fs::symlink_metadata(source_dir.join(".ratex-incomplete")).is_ok() {
+            bail!(
+                "Translation is incomplete in {}. Recover the saved .ratex-chunks files and remove .ratex-incomplete after finishing the source.",
+                source_dir.display()
+            );
+        }
+        let main_tex = latex::find_main_tex(&latex::find_tex_files(&source_dir)?)?;
+        let compiler = compiler::check_available(cli.compiler).await?;
+        let name = source_dir
+            .file_name()
+            .context("Source directory must have a name")?
+            .to_string_lossy();
+        let default_output = source_dir.with_file_name(format!(
+            "{}.pdf",
+            name.strip_suffix("_tex").unwrap_or(&name)
+        ));
+        return compile_pdf(
+            &source_dir,
+            &main_tex,
+            cli.output.as_deref().unwrap_or(&default_output),
+            compiler,
+        )
+        .await;
+    }
+
     let Cli {
         url,
         config,
@@ -76,14 +127,22 @@ async fn run(cli: Cli) -> Result<()> {
         output,
         no_compile,
         concurrency,
+        source_dir,
+        compiler,
+        ..
     } = cli;
 
-    // Pre-flight: detect the compiler now, before translation, so a missing CLI
-    // doesn't waste the LLM bill. Missing → save translated .tex for manual compile.
-    let no_compile = preflight_no_compile(no_compile);
-
     // 1. Parse arXiv ID
-    let arxiv_id = arxiv::parse_id(&url)?;
+    let arxiv_id = arxiv::parse_id(url.as_deref().context("An arXiv ID is required")?)?;
+    let sanitized_id = arxiv_id.replace('/', "_");
+    if no_compile && output.is_some() && source_dir.is_some() {
+        bail!(
+            "With --no-compile, choose either --output or --source-dir for the source directory."
+        );
+    }
+    let source_dir = source_dir
+        .or_else(|| output.clone().filter(|_| no_compile))
+        .unwrap_or_else(|| PathBuf::from(format!("{sanitized_id}_zh_tex")));
     eprintln!("[1/5] Paper ID: {arxiv_id}");
 
     // 2. Load config, resolve profile, create provider
@@ -99,6 +158,19 @@ async fn run(cli: Cli) -> Result<()> {
     )?;
     let provider = Arc::new(translator::Provider::new(&resolved));
     let semaphore = Arc::new(Semaphore::new(resolved.concurrency));
+    let compiler = if no_compile {
+        None
+    } else {
+        match compiler::check_available(compiler).await {
+            Ok(compiler) => Some(compiler),
+            Err(e) => {
+                eprintln!(
+                    "{e:#}\nContinuing with source output only. Use --compile-only after fixing the TeX environment."
+                );
+                None
+            }
+        }
+    };
     eprintln!(
         "[2/5] LLM: {} (model: {}, concurrency: {})",
         resolved.protocol.as_str(),
@@ -107,13 +179,27 @@ async fn run(cli: Cli) -> Result<()> {
     );
 
     // 3. Download and extract source
-    let work_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    // Own a new persistent directory before spending on translation. Never merge
+    // a new download into an existing result or a user's manually fixed source.
+    create_source_dir(&source_dir)?;
+    let source_dir = source_dir.canonicalize()?;
     eprintln!("[3/5] Downloading source from arXiv...");
-    arxiv::download_source(&arxiv_id, work_dir.path()).await?;
-    eprintln!("  Source extracted to: {}", work_dir.path().display());
+    eprintln!(
+        "  Source and completed work will remain in: {}",
+        source_dir.display()
+    );
+    let incomplete = source_dir.join(".ratex-incomplete");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&incomplete)?
+        .write_all(
+            b"Translation has not completed. Completed chunks are in *.ratex-chunks directories.\n",
+        )?;
+    arxiv::download_source(&arxiv_id, &source_dir).await?;
 
     // 4. Find and translate .tex files
-    let tex_files = latex::find_tex_files(work_dir.path())?;
+    let tex_files = latex::find_tex_files(&source_dir)?;
     let main_tex = latex::find_main_tex(&tex_files)?;
     eprintln!(
         "[4/5] Found {} .tex file(s), main: {}",
@@ -121,36 +207,27 @@ async fn run(cli: Cli) -> Result<()> {
         main_tex.file_name().unwrap_or_default().to_string_lossy()
     );
 
-    latex::translate_all(tex_files, &main_tex, provider, semaphore).await?;
-    eprintln!("  Translation complete!");
+    latex::translate_all(tex_files, &main_tex, provider, semaphore)
+        .await
+        .with_context(|| {
+            format!(
+                "Translation failed. Source and completed chunks remain in {}",
+                source_dir.display()
+            )
+        })?;
+    std::fs::remove_file(incomplete)?;
+    eprintln!(
+        "  Translation complete! Source kept in: {}",
+        source_dir.display()
+    );
 
     // 5. Compile or copy output
-    let sanitized_id = arxiv_id.replace('/', "_");
-
-    if no_compile {
-        save_translated_source(work_dir.path(), output.as_deref(), &sanitized_id)?;
+    let Some(compiler) = compiler else {
         return Ok(());
-    }
+    };
 
-    compile_pdf_or_save_source(work_dir.path(), &main_tex, output.as_deref(), &sanitized_id)
-}
-
-fn preflight_no_compile(no_compile_flag: bool) -> bool {
-    if no_compile_flag {
-        return true;
-    }
-
-    match compiler::check_available() {
-        Ok(()) => false,
-        Err(e) => {
-            eprintln!("{e}");
-            eprintln!();
-            eprintln!("Continuing in --no-compile mode (translated .tex will be saved).");
-            eprintln!("You can upload it to Overleaf, or install a compiler and rerun.");
-            eprintln!();
-            true
-        }
-    }
+    let output = output.unwrap_or_else(|| PathBuf::from(format!("{sanitized_id}_zh.pdf")));
+    compile_pdf(&source_dir, &main_tex, &output, compiler).await
 }
 
 fn resolve_profile(
@@ -165,101 +242,104 @@ fn resolve_profile(
     config::resolve(config_file.as_ref(), inputs)
 }
 
-fn save_translated_source(
-    work_dir: &Path,
-    output: Option<&Path>,
-    sanitized_id: &str,
-) -> Result<()> {
-    let output_dir = match output {
-        Some(path) => path.to_path_buf(),
-        None => PathBuf::from(format!("{sanitized_id}_zh_tex")),
-    };
-    utils::copy_dir_recursive(work_dir, &output_dir)?;
-    eprintln!(
-        "[5/5] Translated .tex files saved to: {}",
-        output_dir.display()
-    );
-    Ok(())
+fn create_source_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir(path).with_context(|| {
+        format!("Cannot create source directory {}. Existing results are never overwritten; choose a new --source-dir, or use --compile-only to rebuild existing translations.", path.display())
+    })
 }
 
-fn compile_pdf_or_save_source(
-    work_dir: &Path,
+async fn compile_pdf(
+    source_dir: &Path,
     main_tex: &Path,
-    output: Option<&Path>,
-    sanitized_id: &str,
+    output: &Path,
+    compiler: compiler::Compiler,
 ) -> Result<()> {
-    // Patch the main tex if its \bibliography{} points at a .bib that
-    // isn't in the source archive — without this tectonic clobbers any
-    // pre-generated .bbl when it tries to run bibtex.
-    match latex::inline_missing_bibliography(main_tex) {
-        Ok(true) => eprintln!(
-            "  Inlined pre-generated .bbl (no .bib in source) so bibtex won't clobber it."
-        ),
-        Ok(false) => {}
-        Err(e) => eprintln!("  Warning: bibliography pre-check failed: {e}"),
-    }
-
     eprintln!("[5/5] Compiling PDF...");
-    let pdf_path = match compiler::compile(main_tex) {
-        Ok(p) => p,
-        Err(compile_err) => {
-            return Err(save_source_on_failure(
-                work_dir,
-                main_tex,
-                sanitized_id,
-                compile_err,
-            ));
-        }
-    };
-
-    let output_path = match output {
-        Some(path) => path.to_path_buf(),
-        None => PathBuf::from(format!("{sanitized_id}_zh.pdf")),
-    };
-    std::fs::copy(&pdf_path, &output_path).with_context(|| {
-        format!(
-            "Failed to copy PDF from {} to {}",
-            pdf_path.display(),
-            output_path.display()
-        )
-    })?;
-    eprintln!("Output: {}", output_path.display());
+    let pdf = compiler::compile(source_dir, main_tex, compiler)
+        .await
+        .with_context(|| {
+            format!(
+                "Compilation failed. Source remains in {}. Retry with --compile-only.",
+                source_dir.display()
+            )
+        })?;
+    export_pdf(&pdf, output)?;
+    eprintln!("Output: {}", output.display());
     Ok(())
 }
 
-/// Preserve the translated `.tex` source after a failed compile so the
-/// user can recompile manually without re-paying for translation.
-/// Returns the original compile error after reporting any source-save failure.
-fn save_source_on_failure(
-    work_dir: &Path,
-    main_tex: &Path,
-    sanitized_id: &str,
-    compile_err: anyhow::Error,
-) -> anyhow::Error {
-    let fallback_dir = PathBuf::from(format!("{sanitized_id}_zh_tex"));
-    if let Err(save_err) = utils::copy_dir_recursive(work_dir, &fallback_dir) {
-        eprintln!(
-            "  Warning: also failed to save translated .tex to {}: {}",
-            fallback_dir.display(),
-            save_err,
-        );
-        return compile_err;
+fn export_pdf(pdf: &Path, output: &Path) -> Result<()> {
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    // Replace only after the complete copy succeeds; the compiled PDF remains
+    // in the persistent source directory even if export fails.
+    (|| -> Result<()> {
+        std::fs::create_dir_all(parent)?;
+        let staged = tempfile::NamedTempFile::new_in(parent)?;
+        std::fs::copy(pdf, staged.path())?;
+        staged.persist(output)?;
+        Ok(())
+    })()
+    .with_context(|| {
+        format!(
+            "Failed to export PDF to {}. The compiled PDF is kept at {}",
+            output.display(),
+            pdf.display()
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_supports_compile_without_profile_or_paper() {
+        let cli = Cli::try_parse_from(["ratex", "--compile-only", "paper_zh_tex"]).unwrap();
+        assert!(cli.url.is_none());
+        assert!(Cli::try_parse_from(["ratex"]).is_err());
+        assert!(Cli::try_parse_from(["ratex", "2406.06608", "--compile-only", "paper"]).is_err());
+        assert!(Cli::try_parse_from(["ratex", "--compile-only", "paper", "--no-compile"]).is_err());
     }
 
-    let main_name = match main_tex.file_name() {
-        Some(name) => name.to_string_lossy().into_owned(),
-        None => "<main>.tex".into(),
-    };
-    eprintln!();
-    eprintln!(
-        "  Translated .tex saved to: {} (so you don't have to re-translate)",
-        fallback_dir.display(),
-    );
-    eprintln!("  After fixing the source you can recompile manually, e.g.:");
-    eprintln!(
-        "    cd {} && tectonic {}",
-        fallback_dir.display(),
-        main_name
-    );
-    compile_err
+    #[test]
+    fn persistent_source_and_pdf_survive_export_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        create_source_dir(&source).unwrap();
+        let tex = source.join("main.tex");
+        let pdf = source.join("main.pdf");
+        std::fs::write(&tex, "translated source").unwrap();
+        std::fs::write(&pdf, b"%PDF-1.4 test").unwrap();
+        assert!(create_source_dir(&source).is_err());
+        let blocked_parent = temp.path().join("file");
+        std::fs::write(&blocked_parent, "keep me").unwrap();
+        assert!(export_pdf(&pdf, &blocked_parent.join("out.pdf")).is_err());
+        assert_eq!(std::fs::read_to_string(&tex).unwrap(), "translated source");
+        assert_eq!(std::fs::read(&pdf).unwrap(), b"%PDF-1.4 test");
+        assert_eq!(std::fs::read_to_string(&blocked_parent).unwrap(), "keep me");
+        let output = temp.path().join("nested/out.pdf");
+        export_pdf(&pdf, &output).unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), b"%PDF-1.4 test");
+    }
+
+    #[tokio::test]
+    async fn compile_only_refuses_incomplete_translation() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join(".ratex-incomplete"), "incomplete").unwrap();
+        let cli = Cli::try_parse_from(["ratex", "--compile-only", source.path().to_str().unwrap()])
+            .unwrap();
+        assert!(
+            run(cli)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Translation is incomplete")
+        );
+    }
 }

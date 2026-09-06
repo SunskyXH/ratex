@@ -12,6 +12,8 @@ pub enum Protocol {
     /// Shell out to the Claude Code CLI (`claude -p`) — no API key required,
     /// auth comes from the user's local `claude` installation.
     Claude,
+    /// Use the authenticated local Codex CLI (`codex exec`), with no API key.
+    Codex,
 }
 
 impl Protocol {
@@ -20,6 +22,7 @@ impl Protocol {
             Protocol::OpenAi => "openai",
             Protocol::Gemini => "gemini",
             Protocol::Claude => "claude",
+            Protocol::Codex => "codex",
         }
     }
 
@@ -182,6 +185,7 @@ fn default_endpoint(p: Protocol) -> &'static str {
         Protocol::Gemini => "https://generativelanguage.googleapis.com",
         // For Claude CLI, `endpoint` doubles as the binary path on PATH.
         Protocol::Claude => "claude",
+        Protocol::Codex => "codex",
     }
 }
 
@@ -189,8 +193,8 @@ fn default_model(p: Protocol) -> &'static str {
     match p {
         Protocol::OpenAi => "gpt-4o",
         Protocol::Gemini => "gemini-3-flash-preview",
-        // Empty means: don't pass `--model`; let the Claude CLI pick its default.
-        Protocol::Claude => "",
+        // Empty means: let the authenticated CLI use its configured model.
+        Protocol::Claude | Protocol::Codex => "",
     }
 }
 
@@ -198,8 +202,8 @@ fn default_api_key_env(p: Protocol) -> &'static str {
     match p {
         Protocol::OpenAi => "OPENAI_API_KEY",
         Protocol::Gemini => "GEMINI_API_KEY",
-        // Unused for Claude (gated by `needs_api_key`), kept for exhaustiveness.
-        Protocol::Claude => "",
+        // Unused for CLI protocols (gated by `needs_api_key`).
+        Protocol::Claude | Protocol::Codex => "",
     }
 }
 
@@ -478,5 +482,20 @@ protocol = "anthropic"
             .unwrap_err()
             .to_string();
         assert!(err.contains("GEMINI_API_KEY"), "got: {err}");
+    }
+
+    #[test]
+    fn cli_profiles_use_local_login_without_api_keys() {
+        for name in ["codex", "claude"] {
+            let c: ConfigFile = toml::from_str(&format!(
+                "default_profile = 'local'\n[profiles.local]\nprotocol = '{name}'\n"
+            ))
+            .unwrap();
+            let resolved = resolve_with_env(Some(&c), ResolveInputs::default(), |_| None).unwrap();
+            assert_eq!(resolved.protocol.as_str(), name);
+            assert_eq!(resolved.endpoint, name);
+            assert!(resolved.model.is_empty());
+            assert!(resolved.api_key.is_empty());
+        }
     }
 }
