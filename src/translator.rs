@@ -508,12 +508,37 @@ impl CliProvider {
                     "exec",
                     "--ephemeral",
                     "--skip-git-repo-check",
+                    "--ignore-user-config",
+                    "--ignore-rules",
+                    "--strict-config",
                     "--sandbox",
                     "read-only",
                     "--color",
                     "never",
-                    SYSTEM_PROMPT,
                 ]);
+                // Codex 0.153.4: retain its login, but disable personal tool
+                // integrations. The read-only sandbox also rejects apply_patch.
+                // ponytail: global AGENTS.md still affects wording; omit it
+                // when Codex exposes an auth-preserving switch for that.
+                for setting in [
+                    "cli_auth_credentials_store=\"auto\"",
+                    "project_doc_max_bytes=0",
+                    "web_search=\"disabled\"",
+                    "skills.include_instructions=false",
+                    "skills.bundled.enabled=false",
+                    "orchestrator.skills.enabled=false",
+                    "orchestrator.mcp.enabled=false",
+                    concat!(
+                        "features={shell_tool=false,plugins=false,apps=false,hooks=false,",
+                        "memories=false,multi_agent=false,multi_agent_v2=false,",
+                        "image_generation=false,view_image=false,skip_host_skill_discovery=true,",
+                        "skill_search=false,code_mode_host=false,browser_use=false,",
+                        "computer_use=false,goals=false,sleep_tool=false}"
+                    ),
+                ] {
+                    cmd.args(["-c", setting]);
+                }
+                cmd.arg(SYSTEM_PROMPT);
             }
             _ => unreachable!("only CLI providers use this runner"),
         }
@@ -703,7 +728,20 @@ set -eu
 test -z "$(ls -A)"
 case "$1" in
   exec) test "$2" = --ephemeral; test "$3" = --skip-git-repo-check
-        test "$4" = --sandbox; test "$5" = read-only ;;
+        for flag in --ignore-user-config --ignore-rules --strict-config; do
+          case " $* " in *" $flag "*) ;; *) exit 4 ;; esac
+        done
+        for setting in 'cli_auth_credentials_store="auto"' project_doc_max_bytes=0 'web_search="disabled"' \
+            skills.include_instructions=false orchestrator.mcp.enabled=false \
+            orchestrator.skills.enabled=false; do
+          case " $* " in *" -c $setting "*) ;; *) exit 5 ;; esac
+        done
+        for feature in shell_tool plugins apps hooks memories multi_agent \
+            multi_agent_v2 image_generation view_image code_mode_host \
+            browser_use computer_use; do
+          case "$*" in *"$feature=false"*) ;; *) exit 6 ;; esac
+        done
+        case " $* " in *' --sandbox read-only '*) ;; *) exit 7 ;; esac ;;
   --print) test "$2" = --append-system-prompt ;;
   *) exit 2 ;;
 esac

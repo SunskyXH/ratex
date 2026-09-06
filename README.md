@@ -50,8 +50,10 @@ ratex --compile-only 2406.06608_zh_tex --compiler latexmk -o paper_zh.pdf
 
 For `--compile-only`, the PDF defaults to a sibling of the source directory,
 with its trailing `_tex` replaced by `.pdf` (otherwise `.pdf` is appended).
-No model profile or API key is needed. Compilation runs relative to the source
-root, including when the main `.tex` lives in a subdirectory.
+No model profile or API key is needed. Compilation strips archive wrappers that
+contain only one directory to find the TeX project root. If the source root also
+contains resources, it stays the working directory even when the main `.tex` is
+nested. For ambiguous layouts, point `--compile-only` at the actual project root.
 
 ## Failed runs
 
@@ -66,10 +68,15 @@ for manual recovery. Automatic translation resume is not implemented. Finish
 repairing the source and remove the marker before using `--compile-only`.
 
 Compilation has a five-minute timeout and keeps build logs with the source.
+On macOS/Linux, Ctrl+C and timeouts stop the compiler and its child processes.
 A failed PDF export also leaves the compiled PDF available there. Tectonic runs
 in untrusted mode; the TeX Live backend uses `latexmk` without user/project rc
 files or shell escape. Package and template compatibility still depend on the
 chosen TeX distribution; complex papers may need the TeX Live backend.
+
+When a bibliography is available only as a prebuilt `.bbl`, ratex keeps the
+original and creates a `.ratex-bbl-*.tex` input alongside the project sources.
+Keep that copy with the source when moving or recompiling the translation.
 
 ## Configuration
 
@@ -85,15 +92,22 @@ default_profile = "codex"
 [profiles.codex]
 protocol = "codex"
 concurrency = 1
-# Optional model; omit to use the CLI's default.
+# Optional model; omit to use the CLI's built-in default.
 # model = "..."
 # Optional executable path; otherwise "codex" on PATH.
 # endpoint = "/Users/me/.local/bin/codex"
 ```
 
-`codex` uses `codex exec` and your existing local login. ChatGPT account access
-and usage limits still apply. Each request uses an empty working directory,
-a read-only sandbox, stdin for input, and the final stdout reply for translation.
+`codex` uses `codex exec` and your existing local login. Its isolation flags were
+verified with Codex CLI 0.153.4. ChatGPT account access and usage limits still
+apply. Each request uses an empty working directory, a read-only sandbox, stdin
+for input, and the final stdout reply for translation.
+
+Ratex skips Codex user configuration and disables personal MCP servers, plugins,
+skills, shell commands, and web-search tools. Set the model in your ratex profile if
+needed; the model from Codex configuration is not inherited. Global `AGENTS.md`
+instructions can still influence the reply because the CLI has no switch to
+omit them while keeping the same login store.
 
 Other profiles can coexist in the same file:
 

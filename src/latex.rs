@@ -45,6 +45,7 @@ fn group_end(bytes: &[u8], start: usize) -> Option<usize> {
 }
 
 /// Find literal commands with an optional [...] and a complete {...} argument.
+/// Class/package commands also include their optional trailing release date.
 // ponytail: literal TeX commands only; expand macros only if real papers require it.
 fn commands(content: &str, command: &str) -> Vec<(Range<usize>, Range<usize>)> {
     let bytes = content.as_bytes();
@@ -76,7 +77,20 @@ fn commands(content: &str, command: &str) -> Vec<(Range<usize>, Range<usize>)> {
         if bytes.get(pos) == Some(&b'{')
             && let Some(end) = group_end(bytes, pos)
         {
-            matches.push((start..end, pos + 1..end - 1));
+            let mut command_end = end;
+            if matches!(command, "\\documentclass" | "\\usepackage") {
+                let mut tail = end;
+                while bytes.get(tail).is_some_and(u8::is_ascii_whitespace) {
+                    tail += 1;
+                }
+                if bytes.get(tail) == Some(&b'[') {
+                    let Some(end) = group_end(bytes, tail) else {
+                        continue;
+                    };
+                    command_end = end;
+                }
+            }
+            matches.push((start..command_end, pos + 1..end - 1));
         }
     }
     matches
@@ -119,8 +133,8 @@ fn collect_tex_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
 /// `.bib`. Tectonic auto-runs bibtex on every compile, which silently
 /// fails on the missing `.bib` and overwrites the pre-generated `.bbl`
 /// with an empty stub — leaving every `\cite` rendering as `?`.
-/// Inlining the existing `.bbl` keeps `\bibdata{}` out of the `.aux`,
-/// so tectonic never tries to run bibtex in the first place.
+/// Inputting a `.tex` copy keeps `\bibdata{}` out of the `.aux` and prevents
+/// latexmk from treating the bibliography input as a generated `.bbl`.
 pub fn inline_missing_bibliography(main_tex: &Path, source_root: &Path) -> Result<bool> {
     let content = std::fs::read_to_string(main_tex)
         .with_context(|| format!("Failed to read {}", main_tex.display()))?;
@@ -160,6 +174,15 @@ pub fn inline_missing_bibliography(main_tex: &Path, source_root: &Path) -> Resul
             .or_else(|| Some(main_tex.with_extension("bbl")).filter(|p| p.exists()));
 
         let Some(bbl_path) = bbl else { continue };
+        let temp = tempfile::Builder::new()
+            .prefix(".ratex-bbl-")
+            .suffix(".tex")
+            .tempfile_in(source_root)?;
+        std::fs::copy(&bbl_path, temp.path())
+            .with_context(|| format!("Failed to copy {}", bbl_path.display()))?;
+        let (_, bbl_path) = temp
+            .keep()
+            .context("Failed to preserve bibliography input")?;
         let bbl_filename = bbl_path
             .strip_prefix(source_root)
             .context("bibliography is outside the source directory")?
@@ -561,6 +584,36 @@ mod tests {
     }
 
     #[test]
+    fn cjk_edits_preserve_trailing_release_dates() {
+        let class = "\\documentclass{article}% class date\n \t[2020/01/01]";
+        let src = format!(
+            "{class}% class note\n{}",
+            concat!(
+                "\\usepackage[T1]{fontenc}% package date\n[2017/01/01]% keep this\n",
+                "\\usepackage[utf8]{inputenc} \t[2018/01/01]\n",
+                "\\usepackage{inputenc,graphicx} % keep package date\n[2019/01/01]\n",
+                "\\begin{document}\\texttt{Hello}\\end{document}\n",
+            )
+        );
+        let out = add_cjk_support(&src);
+        assert!(out.starts_with(&format!("{class}\n% [ratex]")), "{out}");
+        assert!(!out.contains("fontenc"), "{out}");
+        assert!(!out.contains("inputenc"), "{out}");
+        assert!(!out.contains("[2017/01/01]"), "{out}");
+        assert!(!out.contains("[2018/01/01]"), "{out}");
+        assert!(out.contains("% keep this\n"), "{out}");
+        assert!(
+            out.contains("\\usepackage{graphicx} % keep package date\n[2019/01/01]"),
+            "{out}"
+        );
+        for command in ["\\begin", "\\end"] {
+            let text = format!("{command}{{document}}[English text]");
+            let (range, _) = &commands(&text, command)[0];
+            assert_eq!(&text[range.end..], "[English text]");
+        }
+    }
+
+    #[test]
     fn chunking_retains_original_separators() {
         let src = "\n\n\\section{One}\nText.% comment\n\n\n\\section{Two}\nMore text.\n\n";
         assert_eq!(split_into_chunks(src, 24).concat(), src);
@@ -648,17 +701,38 @@ mod tests {
         let dir = make_tempdir();
         let main = dir.path().join("main.tex");
         std::fs::write(&main, "before\n\\bibliography{custom}\nafter\n").unwrap();
-        std::fs::write(dir.path().join("main.bbl"), "% bbl content").unwrap();
+        let bibliography = "% bbl content\n\\endinput\n";
+        std::fs::write(dir.path().join("main.bbl"), bibliography).unwrap();
         // No custom.bib, no custom.bbl — fall back to <main_stem>.bbl.
 
         let changed = inline_missing_bibliography(&main, dir.path()).unwrap();
         assert!(changed);
         let out = std::fs::read_to_string(&main).unwrap();
-        assert!(out.contains("\\input{main.bbl}"), "got:\n{out}");
+        let copy = dir
+            .path()
+            .join(&out[commands(&out, "\\input")[0].1.clone()]);
+        assert_eq!(copy.extension().unwrap(), "tex");
+        assert!(
+            copy.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(".ratex-bbl-")
+        );
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), bibliography);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.bbl")).unwrap(),
+            bibliography
+        );
         assert!(
             !out.contains("\\bibliography{custom}"),
             "still has original call:\n{out}"
         );
+        let files = std::fs::read_dir(dir.path()).unwrap().count();
+        assert!(!inline_missing_bibliography(&main, dir.path()).unwrap());
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), out);
+        assert_eq!(std::fs::read_to_string(copy).unwrap(), bibliography);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), files);
     }
 
     #[test]
@@ -671,9 +745,13 @@ mod tests {
 
         inline_missing_bibliography(&main, dir.path()).unwrap();
         let out = std::fs::read_to_string(&main).unwrap();
-        assert!(
-            out.contains("\\input{refs.bbl}"),
-            "expected refs.bbl, got:\n{out}"
+        let copy = dir
+            .path()
+            .join(&out[commands(&out, "\\input")[0].1.clone()]);
+        assert_eq!(std::fs::read_to_string(copy).unwrap(), "named bbl");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("refs.bbl")).unwrap(),
+            "named bbl"
         );
     }
 
@@ -717,9 +795,16 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("refs/custom.bbl"), "existing bibliography").unwrap();
         assert!(inline_missing_bibliography(&main, dir.path()).unwrap());
+        let out = std::fs::read_to_string(&main).unwrap();
+        let input = &out[commands(&out, "\\input")[0].1.clone()];
         assert_eq!(
-            std::fs::read_to_string(main).unwrap(),
-            "% \\bibliography{ignored}\n\\input{refs/custom.bbl}% trailing comment\n"
+            std::fs::read_to_string(dir.path().join(input)).unwrap(),
+            "existing bibliography"
+        );
+        assert!(!main.parent().unwrap().join(input).exists());
+        assert_eq!(
+            out,
+            format!("% \\bibliography{{ignored}}\n\\input{{{input}}}% trailing comment\n")
         );
     }
 }

@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::process::{Child, Command};
 
 // Versioned format-33 bundle verified for Tectonic 0.17.0; downloaded on demand.
 const TECTONIC_BUNDLE: &str = "https://data1b.fullyjustified.net/tlextras-2022.0r0.tar";
@@ -17,7 +18,7 @@ pub enum Compiler {
 }
 
 /// Resolve the backend and compile the fonts/packages translation actually uses.
-pub fn check_available(requested: Compiler) -> Result<Compiler> {
+pub async fn check_available(requested: Compiler) -> Result<Compiler> {
     let candidates: &[Compiler] = match requested {
         Compiler::Auto => &[Compiler::Tectonic, Compiler::Latexmk],
         Compiler::Tectonic => &[Compiler::Tectonic],
@@ -35,7 +36,7 @@ pub fn check_available(requested: Compiler) -> Result<Compiler> {
                 "\\documentclass{article}\n\\begin{document}\n中文 {\\sffamily 中文} {\\ttfamily 中文}\n\\end{document}\n",
             ),
         )?;
-        match compile(dir.path(), &main, compiler) {
+        match compile(dir.path(), &main, compiler).await {
             Ok(_) => return Ok(compiler),
             Err(error) => {
                 let logs = dir.keep();
@@ -53,18 +54,20 @@ pub fn check_available(requested: Compiler) -> Result<Compiler> {
 }
 
 /// Outputs and complete logs stay in a fresh build directory inside the source tree.
-pub fn compile(source_root: &Path, main_tex: &Path, compiler: Compiler) -> Result<PathBuf> {
+pub async fn compile(source_root: &Path, main_tex: &Path, compiler: Compiler) -> Result<PathBuf> {
     if compiler == Compiler::Auto {
         bail!("Resolve the compiler with check_available before compilation");
     }
     let source_root = source_root.canonicalize().context("Invalid source root")?;
     let main_tex = main_tex.canonicalize().context("Invalid main TeX file")?;
-    let relative_main = main_tex
+    main_tex
         .strip_prefix(&source_root)
         .context("Main TeX file must be inside the source root")?;
+    let tex_root = resolve_tex_root(&source_root, &main_tex)?;
+    let relative_main = main_tex.strip_prefix(&tex_root)?;
     // Both engines use a fresh output directory, so make an existing source .bbl
     // explicit rather than relying on the jobname's generated-file lookup.
-    crate::latex::inline_missing_bibliography(&main_tex, &source_root)?;
+    crate::latex::inline_missing_bibliography(&main_tex, &tex_root)?;
     let stem = main_tex
         .file_stem()
         .and_then(|s| s.to_str())
@@ -79,12 +82,12 @@ pub fn compile(source_root: &Path, main_tex: &Path, compiler: Compiler) -> Resul
         Compiler::Latexmk => "latexmk",
         Compiler::Auto => unreachable!(),
     });
-    cmd.current_dir(&source_root);
+    cmd.current_dir(&tex_root);
     // Keep the workspace and its links alive until Tectonic has finished.
     let workspace;
     let pdf_path = match compiler {
         Compiler::Tectonic => {
-            workspace = tectonic_workspace(&source_root, relative_main, stem, &output_dir)?;
+            workspace = tectonic_workspace(&tex_root, relative_main, stem, &output_dir)?;
             cmd.current_dir(workspace.path()).args([
                 "-X",
                 "build",
@@ -113,7 +116,7 @@ pub fn compile(source_root: &Path, main_tex: &Path, compiler: Compiler) -> Resul
         Compiler::Auto => unreachable!(),
     };
     eprintln!("  Using {compiler:?}; full log: {}", log_path.display());
-    run_command(&mut cmd, &log_path, COMPILE_TIMEOUT)?;
+    run_command(&mut cmd, &log_path, COMPILE_TIMEOUT).await?;
     if !pdf_path.is_file() {
         bail!(
             "Compiler succeeded without a PDF; full log: {}",
@@ -121,6 +124,35 @@ pub fn compile(source_root: &Path, main_tex: &Path, compiler: Compiler) -> Resul
         );
     }
     Ok(pdf_path)
+}
+
+fn resolve_tex_root(source_root: &Path, main_tex: &Path) -> Result<PathBuf> {
+    let mut root = source_root.to_path_buf();
+    // ponytail: strip only unambiguous wrapper directories; for mixed layouts,
+    // --compile-only can point at the actual project root instead of guessing TeX paths.
+    while main_tex.parent() != Some(root.as_path()) {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == ".ratex-incomplete"
+                || name.starts_with(".ratex-build-")
+                || name.ends_with(".ratex-chunks")
+            {
+                continue;
+            }
+            entries.push(entry.path());
+        }
+        let [directory] = entries.as_slice() else {
+            break;
+        };
+        if !directory.is_dir() || !main_tex.starts_with(directory) {
+            break;
+        }
+        root = directory.clone();
+    }
+    Ok(root)
 }
 
 #[cfg(unix)]
@@ -154,43 +186,53 @@ fn tectonic_workspace(_: &Path, _: &Path, _: &str, _: &Path) -> Result<tempfile:
     bail!("The Tectonic backend currently supports macOS/Linux; use --compiler latexmk")
 }
 
-fn run_command(cmd: &mut Command, log_path: &Path, timeout: Duration) -> Result<()> {
+// Dropping a compile future (including Ctrl+C) must stop the engine's descendants,
+// not just the latexmk process. Tokio reaps the child after start_kill.
+struct CompilerProcess(Child);
+
+impl CompilerProcess {
+    fn kill(&mut self) {
+        #[cfg(unix)]
+        if let Some(id) = self.0.id() {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-KILL", "--", &format!("-{id}")])
+                .status();
+        }
+        let _ = self.0.start_kill();
+    }
+}
+
+impl Drop for CompilerProcess {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+async fn run_command(cmd: &mut Command, log_path: &Path, timeout: Duration) -> Result<()> {
     let log = File::create(log_path).context("Cannot create compiler log")?;
     cmd.stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
     #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    let mut child = cmd.spawn().with_context(|| {
+    cmd.process_group(0);
+    let mut child = CompilerProcess(cmd.kill_on_drop(true).spawn().with_context(|| {
         format!(
             "Failed to start {}; full log: {}",
-            cmd.get_program().to_string_lossy(),
+            cmd.as_std().get_program().to_string_lossy(),
             log_path.display(),
         )
-    })?;
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if started.elapsed() >= timeout {
-            // latexmk spawns engines: kill its entire process group, then reap it.
-            #[cfg(unix)]
-            let _ = Command::new("/bin/kill")
-                .args(["-KILL", "--", &format!("-{}", child.id())])
-                .status();
-            let _ = child.kill();
-            let _ = child.wait();
+    })?);
+    let status = match tokio::time::timeout(timeout, child.0.wait()).await {
+        Ok(status) => status?,
+        Err(_) => {
+            child.kill();
+            let _ = child.0.wait().await;
             bail!(
                 "Compilation timed out after {}s; full log: {}",
                 timeout.as_secs(),
                 log_path.display()
             );
         }
-        std::thread::sleep(Duration::from_millis(25));
     };
     if !status.success() {
         let log = std::fs::read_to_string(log_path).unwrap_or_default();
@@ -207,6 +249,26 @@ fn run_command(cmd: &mut Command, log_path: &Path, timeout: Duration) -> Result<
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tex_root_strips_wrappers_but_preserves_root_resources() {
+        let source = tempfile::tempdir().unwrap();
+        let paper = source.path().join("wrapper/paper");
+        std::fs::create_dir_all(paper.join("sections")).unwrap();
+        let main = paper.join("main.tex");
+        std::fs::write(&main, "\\input{sections/body}").unwrap();
+        std::fs::write(paper.join("sections/body.tex"), "body").unwrap();
+        std::fs::write(source.path().join(".ratex-incomplete"), "").unwrap();
+        std::fs::create_dir(source.path().join(".ratex-build-old")).unwrap();
+        assert_eq!(resolve_tex_root(source.path(), &main).unwrap(), paper);
+
+        std::fs::write(source.path().join("body.tex"), "root resource").unwrap();
+        assert_eq!(
+            resolve_tex_root(source.path(), &main).unwrap(),
+            source.path()
+        );
+        assert_eq!(resolve_tex_root(&paper, &main).unwrap(), paper);
+    }
 
     #[test]
     fn workspace_preserves_root_entry_and_jobname() {
@@ -238,22 +300,43 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compiler_logs_survive_failure_and_timeout_kills_descendants() {
+    #[tokio::test]
+    async fn compiler_logs_survive_failure_and_cancellation_kills_descendants() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("compiler.log");
         let mut failure = Command::new("/bin/sh");
         failure.args(["-c", "echo stdout; echo stderr >&2; exit 2"]);
-        assert!(run_command(&mut failure, &log, Duration::from_secs(5)).is_err());
+        assert!(
+            run_command(&mut failure, &log, Duration::from_secs(5))
+                .await
+                .is_err()
+        );
         let text = std::fs::read_to_string(&log).unwrap();
         assert!(text.contains("stdout") && text.contains("stderr"));
         let mut hanging = Command::new("/bin/sh");
         hanging
             .current_dir(dir.path())
             .args(["-c", "(sleep 1; touch survived) & wait"]);
-        let err = run_command(&mut hanging, &log, Duration::from_millis(50)).unwrap_err();
+        let err = run_command(&mut hanging, &log, Duration::from_millis(50))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("timed out"));
-        std::thread::sleep(Duration::from_millis(1100));
+
+        // The global Ctrl+C listener drops the compile future in the same way.
+        let mut cancelled = Command::new("/bin/sh");
+        cancelled
+            .current_dir(dir.path())
+            .args(["-c", "(sleep 1; touch survived-cancel) & wait"]);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                run_command(&mut cancelled, &log, Duration::from_secs(5)),
+            )
+            .await
+            .is_err()
+        );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
         assert!(!dir.path().join("survived").exists());
+        assert!(!dir.path().join("survived-cancel").exists());
     }
 }

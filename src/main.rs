@@ -78,7 +78,13 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
 
     let cli = Cli::parse();
-    run(cli).await
+    tokio::select! {
+        result = run(cli) => result,
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("Failed to listen for Ctrl+C")?;
+            bail!("Interrupted; source and completed work remain on disk")
+        }
+    }
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -93,7 +99,7 @@ async fn run(cli: Cli) -> Result<()> {
             );
         }
         let main_tex = latex::find_main_tex(&latex::find_tex_files(&source_dir)?)?;
-        let compiler = compiler::check_available(cli.compiler)?;
+        let compiler = compiler::check_available(cli.compiler).await?;
         let name = source_dir
             .file_name()
             .context("Source directory must have a name")?
@@ -107,7 +113,8 @@ async fn run(cli: Cli) -> Result<()> {
             &main_tex,
             cli.output.as_deref().unwrap_or(&default_output),
             compiler,
-        );
+        )
+        .await;
     }
 
     let Cli {
@@ -154,7 +161,7 @@ async fn run(cli: Cli) -> Result<()> {
     let compiler = if no_compile {
         None
     } else {
-        match compiler::check_available(compiler) {
+        match compiler::check_available(compiler).await {
             Ok(compiler) => Some(compiler),
             Err(e) => {
                 eprintln!(
@@ -220,7 +227,7 @@ async fn run(cli: Cli) -> Result<()> {
     };
 
     let output = output.unwrap_or_else(|| PathBuf::from(format!("{sanitized_id}_zh.pdf")));
-    compile_pdf(&source_dir, &main_tex, &output, compiler)
+    compile_pdf(&source_dir, &main_tex, &output, compiler).await
 }
 
 fn resolve_profile(
@@ -244,19 +251,21 @@ fn create_source_dir(path: &Path) -> Result<()> {
     })
 }
 
-fn compile_pdf(
+async fn compile_pdf(
     source_dir: &Path,
     main_tex: &Path,
     output: &Path,
     compiler: compiler::Compiler,
 ) -> Result<()> {
     eprintln!("[5/5] Compiling PDF...");
-    let pdf = compiler::compile(source_dir, main_tex, compiler).with_context(|| {
-        format!(
-            "Compilation failed. Source remains in {}. Retry with --compile-only.",
-            source_dir.display()
-        )
-    })?;
+    let pdf = compiler::compile(source_dir, main_tex, compiler)
+        .await
+        .with_context(|| {
+            format!(
+                "Compilation failed. Source remains in {}. Retry with --compile-only.",
+                source_dir.display()
+            )
+        })?;
     export_pdf(&pdf, output)?;
     eprintln!("Output: {}", output.display());
     Ok(())
